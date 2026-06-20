@@ -202,47 +202,53 @@ def select(config: str, budget: Optional[int], strategy: Optional[str], output_d
     output_dir_path = Path(cfg.output.output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
 
-    console.print(Panel.fit(
-        f"[bold cyan]主动学习样本选择[/bold cyan]\n"
-        f"策略: [yellow]{cfg.sampler.strategy}[/yellow]\n"
-        f"预算: [yellow]{cfg.sampler.budget}[/yellow] 样本\n"
-        f"数据: [yellow]{cfg.data.data_type}[/yellow]",
-        border_style="cyan",
-    ))
+    tracker = MetricsTracker(output_dir=cfg.output.output_dir)
+    tracker.load_runs()
 
-    device = _resolve_device(cfg.model.device)
-    console.print(f"使用设备: [bold]{device}[/bold]")
-
-    dataset, file_paths, raw_items, labels = _load_dataset(cfg, console)
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    ) as progress:
-        feat_task = progress.add_task("[cyan]提取特征...", total=len(dataset))
-        features = _extract_features(
-            raw_items, cfg.data.data_type, device, progress, feat_task, cfg.model.batch_size,
-        )
-
-    console.print(f"[green]✓[/green] 特征提取完成，特征维度: [bold]{features.shape[1]}[/bold]")
-
-    model_path = Path(cfg.model.model_path)
-    loaded_model = ModelLoader.load(
-        model_path=model_path,
-        model_type=cfg.model.model_type,
-        num_classes=cfg.model.num_classes,
-        device=device,
-    )
-    console.print(f"[green]✓[/green] 加载模型: [bold]{loaded_model.model_type}[/bold]")
-
-    predictor = Predictor(loaded_model)
+    class_names: list = []
+    feat_path: Optional[str] = None
+    csv_path: Optional[str] = None
+    run_status = "failed"
+    err_msg: Optional[str] = None
 
     try:
+        run = tracker.create_run(
+            command="select",
+            config_path=str(config),
+            sampler_strategy=cfg.sampler.strategy,
+            sampler_uncertainty_method=cfg.sampler.uncertainty_method,
+            sampler_uncertainty_weight=cfg.sampler.uncertainty_weight,
+            sampler_diversity_weight=cfg.sampler.diversity_weight,
+            budget=cfg.sampler.budget,
+            output_dir=str(cfg.output.output_dir),
+            config_summary={
+                "data_type": cfg.data.data_type,
+                "num_classes": cfg.model.num_classes,
+                "seed": cfg.seed,
+            },
+        )
+    
+        console.print(Panel.fit(
+            f"[bold cyan]主动学习样本选择[/bold cyan]\n"
+            f"Run ID: [dim]{run.run_id}[/dim]\n"
+            f"策略: [yellow]{cfg.sampler.strategy}[/yellow]\n"
+            f"预算: [yellow]{cfg.sampler.budget}[/yellow] 样本\n"
+            f"数据: [yellow]{cfg.data.data_type}[/yellow]",
+            border_style="cyan",
+        ))
+    
+        device = _resolve_device(cfg.model.device)
+        console.print(f"使用设备: [bold]{device}[/bold]")
+    
+        dataset, file_paths, raw_items, labels = _load_dataset(cfg, console)
+        n_total = len(raw_items)
+        n_labeled = sum(1 for l in (labels or []) if _is_valid_label(l))
+        run.data_type = cfg.data.data_type
+        run.data_path = str(cfg.data.data_path)
+        run.total_samples = n_total
+        run.labeled_samples = n_labeled
+        tracker.save_runs()
+    
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -252,133 +258,195 @@ def select(config: str, budget: Optional[int], strategy: Optional[str], output_d
             TimeRemainingColumn(),
             console=console,
         ) as progress:
-            pred_task = progress.add_task("[magenta]模型推理...", total=len(features))
-            probs = _predict_probs(predictor, features, cfg.model.batch_size, progress, pred_task,
+            feat_task = progress.add_task("[cyan]提取特征...", total=len(dataset))
+            features = _extract_features(
+                raw_items, cfg.data.data_type, device, progress, feat_task, cfg.model.batch_size,
             )
-    except Exception as e:
-        console.print(f"[bold red]✗ 模型推理失败:[/bold red] {e}")
-        console.print("[yellow]已停止执行，未导出待标注 CSV，请检查模型输入维度/格式是否匹配。[/yellow]")
-        raise click.ClickException(f"模型推理失败: {e}")
-
-    console.print(f"[green]✓[/green] 推理完成")
-
-    strategy_name = cfg.sampler.strategy
-    budget = cfg.sampler.budget
-    u_scores = np.zeros(len(features), dtype=np.float32)
-    d_scores = np.zeros(len(features), dtype=np.float32)
-    hybrid_scores = np.zeros(len(features), dtype=np.float32)
-    reasons = [""] * len(features)
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        console=console,
-    ) as progress:
-        samp_task = progress.add_task(f"[yellow]执行采样策略: {strategy_name}...", total=100)
-
-        if strategy_name == "uncertainty":
-            sampler = UncertaintySampler(method=cfg.sampler.uncertainty_method)
-            result = sampler.score(probs)
-            u_scores = result.scores
-            d_scores = np.zeros_like(u_scores)
-            hybrid_scores = u_scores
-            for i in range(len(reasons)):
-                reasons[i] = f"不确定性({cfg.sampler.uncertainty_method})"
-        elif strategy_name == "diversity":
-            sampler = DiversitySampler(
-                num_clusters=cfg.sampler.num_clusters or budget,
-                seed=cfg.seed,
-            )
-            div_result = sampler.score(features, budget)
-            d_scores = div_result.scores
-            u_scores = np.zeros_like(d_scores)
-            hybrid_scores = d_scores
-            for i in range(len(reasons)):
-                reasons[i] = "多样性(KMeans聚类)"
-        elif strategy_name == "hybrid":
-            sampler = HybridSampler(
-                uncertainty_method=cfg.sampler.uncertainty_method,
-                uncertainty_weight=cfg.sampler.uncertainty_weight,
-                diversity_weight=cfg.sampler.diversity_weight,
-                num_clusters=cfg.sampler.num_clusters or budget,
-                seed=cfg.seed,
-            )
-            h_result = sampler.score(probs, features, budget)
-            u_scores = h_result.uncertainty_scores
-            d_scores = h_result.diversity_scores
-            hybrid_scores = h_result.scores
-            for i in range(len(reasons)):
-                reasons[i] = HybridSampler.get_reason(
-                    float(u_scores[i]),
-                    float(d_scores[i]),
-                    cfg.sampler.uncertainty_weight,
-                    cfg.sampler.diversity_weight,
+    
+        console.print(f"[green]✓[/green] 特征提取完成，特征维度: [bold]{features.shape[1]}[/bold]")
+    
+        model_path = Path(cfg.model.model_path)
+        loaded_model = ModelLoader.load(
+            model_path=model_path,
+            model_type=cfg.model.model_type,
+            num_classes=cfg.model.num_classes,
+            device=device,
+        )
+        console.print(f"[green]✓[/green] 加载模型: [bold]{loaded_model.model_type}[/bold]")
+        run.model_path = str(model_path)
+        run.model_type = loaded_model.model_type
+        run.num_classes = loaded_model.num_classes
+        tracker.save_runs()
+    
+        trainer_aux = Trainer(
+            num_classes=cfg.model.num_classes,
+            checkpoint_dir=cfg.train.checkpoint_dir,
+            device="cpu",
+        )
+        latest_le = trainer_aux.get_latest_label_encoder()
+        if latest_le is not None:
+            try:
+                le = Trainer.load_label_encoder(latest_le)
+                class_names = list(le.classes_)
+                run.label_encoder_path = str(latest_le)
+                run.class_names = class_names
+                tracker.save_runs()
+            except Exception:
+                pass
+    
+        predictor = Predictor(loaded_model)
+    
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                console=console,
+            ) as progress:
+                pred_task = progress.add_task("[magenta]模型推理...", total=len(features))
+                probs = _predict_probs(predictor, features, cfg.model.batch_size, progress, pred_task,
                 )
-        elif strategy_name == "qbc":
-            sampler = QBCSampler(seed=cfg.seed)
-            X_train = None
-            y_train = None
-            if labels is not None and len(labels) > 0:
-                valid_mask = np.array([_is_valid_label(l) for l in labels])
-                if valid_mask.any():
-                    X_train = features[valid_mask]
-                    y_train = np.array([l for l, v in zip(labels, valid_mask) if v])
-            qbc_result = sampler.score(features, X_train, y_train, predictor)
-            hybrid_scores = qbc_result.scores
-            u_scores = hybrid_scores
-            d_scores = np.zeros_like(hybrid_scores)
-            for i in range(len(reasons)):
-                reasons[i] = "委员会投票(QBC)"
-        else:
-            raise click.ClickException(f"未知策略: {strategy_name}")
-
-        progress.update(samp_task, advance=50)
-
-        selector = BatchSelector(budget=budget, seed=cfg.seed)
-        selection = selector.select(
-            scores=hybrid_scores,
-            features=features,
-            uncertainty_scores=u_scores,
-            diversity_scores=d_scores,
-            file_paths=file_paths,
-            probs=probs,
-            u_weight=cfg.sampler.uncertainty_weight,
-            d_weight=cfg.sampler.diversity_weight,
+        except Exception as e:
+            console.print(f"[bold red]✗ 模型推理失败:[/bold red] {e}")
+            console.print("[yellow]已停止执行，未导出待标注 CSV，请检查模型输入维度/格式是否匹配。[/yellow]")
+            raise click.ClickException(f"模型推理失败: {e}")
+    
+        console.print(f"[green]✓[/green] 推理完成")
+    
+        strategy_name = cfg.sampler.strategy
+        budget = cfg.sampler.budget
+        u_scores = np.zeros(len(features), dtype=np.float32)
+        d_scores = np.zeros(len(features), dtype=np.float32)
+        hybrid_scores = np.zeros(len(features), dtype=np.float32)
+        reasons = [""] * len(features)
+    
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            console=console,
+        ) as progress:
+            samp_task = progress.add_task(f"[yellow]执行采样策略: {strategy_name}...", total=100)
+    
+            if strategy_name == "uncertainty":
+                sampler = UncertaintySampler(method=cfg.sampler.uncertainty_method)
+                result = sampler.score(probs)
+                u_scores = result.scores
+                d_scores = np.zeros_like(u_scores)
+                hybrid_scores = u_scores
+                for i in range(len(reasons)):
+                    reasons[i] = f"不确定性({cfg.sampler.uncertainty_method})"
+            elif strategy_name == "diversity":
+                sampler = DiversitySampler(
+                    num_clusters=cfg.sampler.num_clusters or budget,
+                    seed=cfg.seed,
+                )
+                div_result = sampler.score(features, budget)
+                d_scores = div_result.scores
+                u_scores = np.zeros_like(d_scores)
+                hybrid_scores = d_scores
+                for i in range(len(reasons)):
+                    reasons[i] = "多样性(KMeans聚类)"
+            elif strategy_name == "hybrid":
+                sampler = HybridSampler(
+                    uncertainty_method=cfg.sampler.uncertainty_method,
+                    uncertainty_weight=cfg.sampler.uncertainty_weight,
+                    diversity_weight=cfg.sampler.diversity_weight,
+                    num_clusters=cfg.sampler.num_clusters or budget,
+                    seed=cfg.seed,
+                )
+                h_result = sampler.score(probs, features, budget)
+                u_scores = h_result.uncertainty_scores
+                d_scores = h_result.diversity_scores
+                hybrid_scores = h_result.scores
+                for i in range(len(reasons)):
+                    reasons[i] = HybridSampler.get_reason(
+                        float(u_scores[i]),
+                        float(d_scores[i]),
+                        cfg.sampler.uncertainty_weight,
+                        cfg.sampler.diversity_weight,
+                    )
+            elif strategy_name == "qbc":
+                sampler = QBCSampler(seed=cfg.seed)
+                X_train = None
+                y_train = None
+                if labels is not None and len(labels) > 0:
+                    valid_mask = np.array([_is_valid_label(l) for l in labels])
+                    if valid_mask.any():
+                        X_train = features[valid_mask]
+                        y_train = np.array([l for l, v in zip(labels, valid_mask) if v])
+                qbc_result = sampler.score(features, X_train, y_train, predictor)
+                hybrid_scores = qbc_result.scores
+                u_scores = hybrid_scores
+                d_scores = np.zeros_like(hybrid_scores)
+                for i in range(len(reasons)):
+                    reasons[i] = "委员会投票(QBC)"
+            else:
+                raise click.ClickException(f"未知策略: {strategy_name}")
+    
+            progress.update(samp_task, advance=50)
+    
+            selector = BatchSelector(budget=budget, seed=cfg.seed)
+            selection = selector.select(
+                scores=hybrid_scores,
+                features=features,
+                uncertainty_scores=u_scores,
+                diversity_scores=d_scores,
+                file_paths=file_paths,
+                probs=probs,
+                u_weight=cfg.sampler.uncertainty_weight,
+                d_weight=cfg.sampler.diversity_weight,
+            )
+    
+            progress.update(samp_task, advance=50)
+    
+        console.print(f"[green]✓[/green] 采样完成，选择 [bold]{len(selection)}[/bold] 个样本")
+    
+        table = _display_table(
+            selection.indices, file_paths, u_scores, d_scores, reasons, cfg.output.top_k_display,
         )
-
-        progress.update(samp_task, advance=50)
-
-    console.print(f"[green]✓[/green] 采样完成，选择 [bold]{len(selection)}[/bold] 个样本")
-
-    table = _display_table(
-        selection.indices, file_paths, u_scores, d_scores, reasons, cfg.output.top_k_display,
-    )
-    console.print(table)
-
-    exporter = CSVExporter(output_dir=cfg.output.output_dir)
-    csv_path = exporter.export(selection)
-    console.print(f"[green]✓[/green] CSV 已导出: [bold]{csv_path}[/bold]")
-
-    if cfg.output.export_visualization:
-        visualizer = Visualizer(output_dir=cfg.output.output_dir)
-        labeled_mask = None
-        if labels is not None:
-            labeled_mask = np.array([_is_valid_label(l) for l in labels])
-        feat_path = visualizer.plot_feature_space(
-            features=features,
-            labeled_mask=labeled_mask,
-            selected_indices=selection.indices,
-            labels=np.array(labels) if labels is not None else None,
-        )
-        console.print(f"[green]✓[/green] 特征空间图: [bold]{feat_path}[/bold]")
-
-    console.print(Panel.fit(
-        f"[bold green]采样完成![/bold green]\n"
-        f"已选择 [bold cyan]{len(selection)}[/bold cyan] 个样本用于标注\n"
-        f"输出目录: [bold]{cfg.output.output_dir}[/bold]",
-        border_style="green",
-    ))
+        console.print(table)
+    
+        exporter = CSVExporter(output_dir=cfg.output.output_dir)
+        csv_path = exporter.export(selection)
+        console.print(f"[green]✓[/green] CSV 已导出: [bold]{csv_path}[/bold]")
+        run.output_csv = csv_path
+    
+        if cfg.output.export_visualization:
+            visualizer = Visualizer(output_dir=cfg.output.output_dir)
+            labeled_mask = None
+            if labels is not None:
+                labeled_mask = np.array([_is_valid_label(l) for l in labels])
+            feat_path = visualizer.plot_feature_space(
+                features=features,
+                labeled_mask=labeled_mask,
+                selected_indices=selection.indices,
+                labels=np.array(labels) if labels is not None else None,
+            )
+            console.print(f"[green]✓[/green] 特征空间图: [bold]{feat_path}[/bold]")
+            run.output_visualization = feat_path
+    
+        run_status = "success"
+    
+        console.print(Panel.fit(
+            f"[bold green]采样完成![/bold green]\n"
+            f"已选择 [bold cyan]{len(selection)}[/bold cyan] 个样本用于标注\n"
+            f"输出目录: [bold]{cfg.output.output_dir}[/bold]",
+            border_style="green",
+        ))
+    finally:
+        if "run" in locals():
+            tracker.finish_run(
+                run,
+                status=run_status,
+                error_message=err_msg,
+                output_csv=csv_path,
+                output_visualization=feat_path,
+                class_names=class_names,
+            )
 
 
 @cli.command(help="查看历史迭代指标和学习曲线")
@@ -399,11 +467,10 @@ def review(metrics: Optional[str], output_dir: Optional[str]):
             console.print(f"[dim]自动加载历史指标: {hp}[/dim]")
         else:
             console.print("[yellow]提示:[/yellow] 未找到历史指标文件，请先运行 iterate 或指定 --metrics 参数")
-            return
-
-    console.print(tracker.summary())
 
     if tracker.metrics:
+        console.print(tracker.summary())
+
         visualizer = Visualizer(output_dir=out_dir)
         curve_path = visualizer.plot_learning_curve(
             iterations=tracker.iterations,
@@ -412,6 +479,53 @@ def review(metrics: Optional[str], output_dir: Optional[str]):
             f1_scores=tracker.f1_scores,
         )
         console.print(f"[green]✓[/green] 学习曲线: [bold]{curve_path}[/bold]")
+
+    tracker.load_runs()
+    if tracker.runs:
+        console.print(Panel.fit(
+            "[bold cyan]历史实验 Run 记录[/bold cyan]",
+            border_style="cyan",
+        ))
+
+        table = Table(show_lines=False)
+        table.add_column("Run ID", style="cyan")
+        table.add_column("Command", style="white")
+        table.add_column("状态", style="white")
+        table.add_column("开始时间", style="white")
+        table.add_column("耗时(s)", justify="right", style="white")
+        table.add_column("策略", style="yellow")
+        table.add_column("预算", justify="right", style="yellow")
+        table.add_column("输出CSV", style="green")
+        table.add_column("模型路径", style="magenta")
+
+        for run in tracker.runs:
+            status_str = run.status or "unknown"
+            if status_str == "success":
+                status_display = f"[green]{status_str}[/green]"
+            elif status_str == "failed":
+                status_display = f"[red]{status_str}[/red]"
+            elif status_str == "running":
+                status_display = f"[yellow]{status_str}[/yellow]"
+            else:
+                status_display = status_str
+
+            duration_str = ""
+            if run.duration_sec is not None:
+                duration_str = f"{run.duration_sec:.1f}"
+
+            table.add_row(
+                str(run.run_id),
+                str(run.command or ""),
+                status_display,
+                str(run.start_time or ""),
+                duration_str,
+                str(run.sampler_strategy or ""),
+                str(run.budget or ""),
+                str(run.output_csv or ""),
+                str(run.model_path or ""),
+            )
+
+        console.print(table)
 
 
 @cli.command(help="用新标注数据重训练模型，并进行下一轮采样")
@@ -427,268 +541,356 @@ def iterate(config: str, labels: str, resume: bool, output_dir: Optional[str]):
     output_dir_path = Path(cfg.output.output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
 
-    console.print(Panel.fit(
-        "[bold cyan]迭代: 标注 → 重训练 → 下一轮采样[/bold cyan]",
-        border_style="cyan",
-    ))
+    tracker = MetricsTracker(output_dir=cfg.output.output_dir)
+    tracker.load_runs()
 
-    device = _resolve_device(cfg.model.device)
+    class_names: list = []
+    csv_path: Optional[str] = None
+    curve_path: Optional[str] = None
+    feat_path: Optional[str] = None
+    final_model_path: Optional[str] = None
+    total_samples: int = 0
+    labeled_samples: int = 0
+    run_status = "failed"
+    err_msg: Optional[str] = None
 
-    dataset, file_paths, raw_items, existing_labels = _load_dataset(cfg, console)
-
-    import pandas as pd
-    import chardet
-
-    labels_path = Path(labels)
-    with open(labels_path, "rb") as f:
-        enc = chardet.detect(f.read(65536)).get("encoding", "utf-8") or "utf-8"
     try:
-        labels_df = pd.read_csv(labels_path, encoding=enc)
-    except UnicodeDecodeError:
-        labels_df = pd.read_csv(labels_path, encoding="utf-8", errors="ignore")
-
-    console.print(f"[green]✓[/green] 加载新标注数据: [bold]{len(labels_df)}[/bold] 条")
-
-    path_col = None
-    label_col = None
-    lower_cols = {c.lower(): c for c in labels_df.columns}
-    for cand in ["path", "file_path", "file", "image", "audio", "sample"]:
-        if cand in lower_cols:
-            path_col = lower_cols[cand]
-            break
-    if path_col is None:
-        path_col = labels_df.columns[0]
-    for cand in ["label", "category", "class", "target", "y"]:
-        if cand in lower_cols:
-            label_col = lower_cols[cand]
-            break
-    if label_col is None:
-        label_col = labels_df.columns[-1]
-
-    new_labels_map = {}
-    for _, row in labels_df.iterrows():
-        fp = str(row[path_col]).replace("\\", "/")
-        lbl = row[label_col]
-        new_labels_map[fp] = lbl
-
-    all_labels = [None] * len(file_paths)
-    for i, fp in enumerate(file_paths):
-        norm_fp = fp.replace("\\", "/")
-        if norm_fp in new_labels_map:
-            all_labels[i] = new_labels_map[norm_fp]
-
-    if existing_labels is not None:
-        for i in range(len(existing_labels)):
-            if _is_valid_label(existing_labels[i]):
-                all_labels[i] = existing_labels[i]
-
-    with Progress(console=console) as progress:
-        feat_task = progress.add_task("[cyan]提取特征...", total=len(dataset))
-        features = _extract_features(raw_items, cfg.data.data_type, device, progress, feat_task, cfg.model.batch_size)
-
-    labeled_mask = np.array([_is_valid_label(l) for l in all_labels])
-    X_labeled = features[labeled_mask]
-    y_labeled = np.array([l for l, v in zip(all_labels, labeled_mask) if v])
-
-    console.print(f"已标注样本数: [bold]{X_labeled.shape[0]}[/bold] / [bold]{len(features)}[/bold]")
-
-    model_path = Path(cfg.model.model_path)
-    if resume:
-        trainer = Trainer(
-            num_classes=cfg.model.num_classes,
-            checkpoint_dir=cfg.train.checkpoint_dir,
-            device=device,
-        )
-        ckpt = trainer.resume()
-        if ckpt:
-            console.print(f"[green]✓[/green] 从 checkpoint 恢复: [bold]{ckpt}[/bold]")
-            model_path = ckpt
-
-    loaded_model = ModelLoader.load(
-        model_path=model_path,
-        model_type=cfg.model.model_type,
-        num_classes=cfg.model.num_classes,
-        device=device,
-    )
-    console.print(f"[green]✓[/green] 加载基线模型")
-
-    if cfg.train.enabled and len(X_labeled) > 10:
-        console.print("[cyan]开始重训练...")
-        trainer = Trainer(
-            num_classes=cfg.model.num_classes,
-            checkpoint_dir=cfg.train.checkpoint_dir,
-            device=device,
+        run = tracker.create_run(
+            command="iterate",
+            config_path=str(config),
+            sampler_strategy=cfg.sampler.strategy,
+            sampler_uncertainty_method=cfg.sampler.uncertainty_method,
+            sampler_uncertainty_weight=cfg.sampler.uncertainty_weight,
+            sampler_diversity_weight=cfg.sampler.diversity_weight,
+            budget=cfg.sampler.budget,
+            output_dir=str(cfg.output.output_dir),
+            config_summary={
+                "data_type": cfg.data.data_type,
+                "num_classes": cfg.model.num_classes,
+                "seed": cfg.seed,
+            },
         )
 
-        existing_le = None
-        latest_le_path = trainer.get_latest_label_encoder()
-        if latest_le_path is not None:
-            try:
-                existing_le = Trainer.load_label_encoder(latest_le_path)
-                console.print(f"[green]✓[/green] 复用已有类别映射: [bold]{latest_le_path}[/bold] ({len(existing_le.classes_)} 类)")
-            except Exception as e:
-                console.print(f"[yellow]警告: 加载已有 label_encoder 失败，将重新生成: {e}[/yellow]")
+        console.print(Panel.fit(
+            f"[bold cyan]迭代: 标注 → 重训练 → 下一轮采样[/bold cyan]\n"
+            f"Run ID: [dim]{run.run_id}[/dim]\n"
+            f"策略: [yellow]{cfg.sampler.strategy}[/yellow]\n"
+            f"预算: [yellow]{cfg.sampler.budget}[/yellow] 样本\n"
+            f"数据: [yellow]{cfg.data.data_type}[/yellow]",
+            border_style="cyan",
+        ))
 
-        from sklearn.model_selection import train_test_split
+        device = _resolve_device(cfg.model.device)
 
-        if len(X_labeled) > 50:
-            X_tr, X_val, y_tr, y_val = train_test_split(
-                X_labeled, y_labeled, test_size=0.2, random_state=cfg.seed,
+        dataset, file_paths, raw_items, existing_labels = _load_dataset(cfg, console)
+        n_total = len(raw_items)
+        n_labeled = sum(1 for l in (existing_labels or []) if _is_valid_label(l))
+        total_samples = n_total
+        labeled_samples = n_labeled
+        run.data_type = cfg.data.data_type
+        run.data_path = str(cfg.data.data_path)
+        run.total_samples = n_total
+        run.labeled_samples = n_labeled
+        tracker.save_runs()
+
+        import pandas as pd
+        import chardet
+
+        labels_path = Path(labels)
+        with open(labels_path, "rb") as f:
+            enc = chardet.detect(f.read(65536)).get("encoding", "utf-8") or "utf-8"
+        try:
+            labels_df = pd.read_csv(labels_path, encoding=enc)
+        except UnicodeDecodeError:
+            labels_df = pd.read_csv(labels_path, encoding="utf-8", errors="ignore")
+
+        console.print(f"[green]✓[/green] 加载新标注数据: [bold]{len(labels_df)}[/bold] 条")
+
+        path_col = None
+        label_col = None
+        lower_cols = {c.lower(): c for c in labels_df.columns}
+        for cand in ["path", "file_path", "file", "image", "audio", "sample"]:
+            if cand in lower_cols:
+                path_col = lower_cols[cand]
+                break
+        if path_col is None:
+            path_col = labels_df.columns[0]
+        for cand in ["label", "category", "class", "target", "y"]:
+            if cand in lower_cols:
+                label_col = lower_cols[cand]
+                break
+        if label_col is None:
+            label_col = labels_df.columns[-1]
+
+        new_labels_map = {}
+        for _, row in labels_df.iterrows():
+            fp = str(row[path_col]).replace("\\", "/")
+            lbl = row[label_col]
+            new_labels_map[fp] = lbl
+
+        all_labels = [None] * len(file_paths)
+        for i, fp in enumerate(file_paths):
+            norm_fp = fp.replace("\\", "/")
+            if norm_fp in new_labels_map:
+                all_labels[i] = new_labels_map[norm_fp]
+
+        if existing_labels is not None:
+            for i in range(len(existing_labels)):
+                if _is_valid_label(existing_labels[i]):
+                    all_labels[i] = existing_labels[i]
+
+        with Progress(console=console) as progress:
+            feat_task = progress.add_task("[cyan]提取特征...", total=len(dataset))
+            features = _extract_features(raw_items, cfg.data.data_type, device, progress, feat_task, cfg.model.batch_size)
+
+        labeled_mask = np.array([_is_valid_label(l) for l in all_labels])
+        X_labeled = features[labeled_mask]
+        y_labeled = np.array([l for l, v in zip(all_labels, labeled_mask) if v])
+
+        console.print(f"已标注样本数: [bold]{X_labeled.shape[0]}[/bold] / [bold]{len(features)}[/bold]")
+
+        model_path = Path(cfg.model.model_path)
+        if resume:
+            trainer = Trainer(
+                num_classes=cfg.model.num_classes,
+                checkpoint_dir=cfg.train.checkpoint_dir,
+                device=device,
             )
+            ckpt = trainer.resume()
+            if ckpt:
+                console.print(f"[green]✓[/green] 从 checkpoint 恢复: [bold]{ckpt}[/bold]")
+                model_path = ckpt
+
+        loaded_model = ModelLoader.load(
+            model_path=model_path,
+            model_type=cfg.model.model_type,
+            num_classes=cfg.model.num_classes,
+            device=device,
+        )
+        console.print(f"[green]✓[/green] 加载基线模型")
+        run.model_path = str(model_path)
+        run.model_type = loaded_model.model_type
+        run.num_classes = loaded_model.num_classes
+        tracker.save_runs()
+
+        if cfg.train.enabled and len(X_labeled) > 10:
+            console.print("[cyan]开始重训练...")
+            trainer = Trainer(
+                num_classes=cfg.model.num_classes,
+                checkpoint_dir=cfg.train.checkpoint_dir,
+                device=device,
+            )
+
+            existing_le = None
+            latest_le_path = trainer.get_latest_label_encoder()
+            if latest_le_path is not None:
+                try:
+                    existing_le = Trainer.load_label_encoder(latest_le_path)
+                    console.print(f"[green]✓[/green] 复用已有类别映射: [bold]{latest_le_path}[/bold] ({len(existing_le.classes_)} 类)")
+                except Exception as e:
+                    console.print(f"[yellow]警告: 加载已有 label_encoder 失败，将重新生成: {e}[/yellow]")
+
+            from sklearn.model_selection import train_test_split
+
+            if len(X_labeled) > 50:
+                X_tr, X_val, y_tr, y_val = train_test_split(
+                    X_labeled, y_labeled, test_size=0.2, random_state=cfg.seed,
+                )
+            else:
+                X_tr, y_tr = X_labeled, y_labeled
+                X_val, y_val = None, None
+
+            train_result = trainer.train(
+                base_model=loaded_model.model,
+                model_type=loaded_model.model_type,
+                X_train=X_tr,
+                y_train=y_tr,
+                X_val=X_val,
+                y_val=y_val,
+                epochs=cfg.train.epochs,
+                learning_rate=cfg.train.learning_rate,
+                early_stopping_patience=cfg.train.early_stopping_patience,
+                freeze_backbone=cfg.train.freeze_backbone,
+                existing_label_encoder=existing_le,
+            )
+
+            console.print(
+                f"[green]✓[/green] 重训练完成: 准确率 [bold]{train_result.accuracy:.4f}[/bold], "
+                f"F1 [bold]{train_result.f1_macro:.4f}[/bold]"
+            )
+            console.print(f"新模型保存: [bold]{train_result.model_path}[/bold]")
+            if train_result.label_encoder_path:
+                console.print(f"类别映射保存: [bold]{train_result.label_encoder_path}[/bold]")
+                try:
+                    le = Trainer.load_label_encoder(train_result.label_encoder_path)
+                    class_names = list(le.classes_)
+                    run.label_encoder_path = str(train_result.label_encoder_path)
+                    run.class_names = class_names
+                    tracker.save_runs()
+                except Exception:
+                    pass
+
+            tracker_metrics = MetricsTracker(output_dir=cfg.output.output_dir)
+            tracker_metrics.load_history()
+            current_iter = tracker_metrics.next_iteration
+            tracker_metrics.add(
+                iteration=current_iter,
+                labeled_count=len(X_labeled),
+                accuracy=train_result.accuracy,
+                f1_macro=train_result.f1_macro,
+                selected_count=cfg.sampler.budget,
+                model_path=train_result.model_path,
+            )
+            metrics_path = tracker_metrics.save_history()
+            console.print(f"[green]✓[/green] 第 [bold]{current_iter}[/bold] 轮指标保存: [bold]{metrics_path}[/bold]")
+
+            if cfg.output.export_visualization:
+                visualizer = Visualizer(output_dir=cfg.output.output_dir)
+                curve_path = visualizer.plot_learning_curve(
+                    iterations=tracker_metrics.iterations,
+                    labeled_counts=tracker_metrics.labeled_counts,
+                    accuracies=tracker_metrics.accuracies,
+                    f1_scores=tracker_metrics.f1_scores,
+                )
+                console.print(f"[green]✓[/green] 学习曲线: [bold]{curve_path}[/bold]")
+                run.output_learning_curve = curve_path
+                tracker.save_runs()
+
+            new_model_path = train_result.model_path
         else:
-            X_tr, y_tr = X_labeled, y_labeled
-            X_val, y_val = None, None
+            if not cfg.train.enabled:
+                console.print("[yellow]训练已禁用[/yellow]")
+            else:
+                console.print("[yellow]标注样本不足，跳过训练[/yellow]")
+            new_model_path = str(model_path)
 
-        train_result = trainer.train(
-            base_model=loaded_model.model,
-            model_type=loaded_model.model_type,
-            X_train=X_tr,
-            y_train=y_tr,
-            X_val=X_val,
-            y_val=y_val,
-            epochs=cfg.train.epochs,
-            learning_rate=cfg.train.learning_rate,
-            early_stopping_patience=cfg.train.early_stopping_patience,
-            freeze_backbone=cfg.train.freeze_backbone,
-            existing_label_encoder=existing_le,
+        final_model_path = new_model_path
+
+        console.print("[cyan]开始下一轮采样...")
+        loaded_new = ModelLoader.load(
+            model_path=new_model_path,
+            model_type=cfg.model.model_type,
+            num_classes=cfg.model.num_classes,
+            device=device,
+        )
+        predictor = Predictor(loaded_new)
+
+        try:
+            with Progress(console=console) as progress:
+                pred_task = progress.add_task("[magenta]模型推理...", total=len(features))
+                probs = _predict_probs(predictor, features, cfg.model.batch_size, progress, pred_task)
+        except Exception as e:
+            console.print(f"[bold red]✗ 下一轮采样推理失败:[/bold red] {e}")
+            console.print("[yellow]已停止执行，未导出待标注 CSV，请检查模型。[/yellow]")
+            raise click.ClickException(f"下一轮采样推理失败: {e}")
+
+        budget = cfg.sampler.budget
+        strategy_name = cfg.sampler.strategy
+        u_scores = np.zeros(len(features), dtype=np.float32)
+        d_scores = np.zeros(len(features), dtype=np.float32)
+        hybrid_scores = np.zeros(len(features), dtype=np.float32)
+        reasons = [""] * len(features)
+
+        if strategy_name == "uncertainty":
+            sampler = UncertaintySampler(method=cfg.sampler.uncertainty_method)
+            result = sampler.score(probs)
+            u_scores = result.scores
+            hybrid_scores = u_scores
+            for i in range(len(reasons)):
+                reasons[i] = f"不确定性({cfg.sampler.uncertainty_method})"
+        elif strategy_name == "diversity":
+            sampler = DiversitySampler(num_clusters=cfg.sampler.num_clusters or budget, seed=cfg.seed)
+            div_result = sampler.score(features, budget)
+            d_scores = div_result.scores
+            hybrid_scores = d_scores
+            for i in range(len(reasons)):
+                reasons[i] = "多样性(KMeans)"
+        elif strategy_name == "qbc":
+            sampler = QBCSampler(seed=cfg.seed)
+            valid_mask = np.array([_is_valid_label(l) for l in all_labels])
+            X_train_qbc = features[valid_mask] if valid_mask.any() else None
+            y_train_qbc = np.array([l for l, v in zip(all_labels, valid_mask) if v]) if valid_mask.any() else None
+            qbc_result = sampler.score(features, X_train_qbc, y_train_qbc, predictor)
+            hybrid_scores = qbc_result.scores
+            u_scores = hybrid_scores
+            d_scores = np.zeros_like(hybrid_scores)
+            for i in range(len(reasons)):
+                reasons[i] = "委员会投票(QBC)"
+        else:
+            sampler = HybridSampler(
+                uncertainty_method=cfg.sampler.uncertainty_method,
+                uncertainty_weight=cfg.sampler.uncertainty_weight,
+                diversity_weight=cfg.sampler.diversity_weight,
+                num_clusters=cfg.sampler.num_clusters or budget,
+                seed=cfg.seed,
+            )
+            h_result = sampler.score(probs, features, budget)
+            u_scores = h_result.uncertainty_scores
+            d_scores = h_result.diversity_scores
+            hybrid_scores = h_result.scores
+            for i in range(len(reasons)):
+                reasons[i] = HybridSampler.get_reason(
+                    float(u_scores[i]),
+                    float(d_scores[i]),
+                    cfg.sampler.uncertainty_weight,
+                    cfg.sampler.diversity_weight,
+                )
+
+        selector = BatchSelector(budget=budget, seed=cfg.seed)
+        selection = selector.select(
+            scores=hybrid_scores,
+            features=features,
+            uncertainty_scores=u_scores,
+            diversity_scores=d_scores,
+            file_paths=file_paths,
+            probs=probs,
+            u_weight=cfg.sampler.uncertainty_weight,
+            d_weight=cfg.sampler.diversity_weight,
         )
 
-        console.print(
-            f"[green]✓[/green] 重训练完成: 准确率 [bold]{train_result.accuracy:.4f}[/bold], "
-            f"F1 [bold]{train_result.f1_macro:.4f}[/bold]"
+        table = _display_table(
+            selection.indices, file_paths, u_scores, d_scores, reasons, cfg.output.top_k_display,
         )
-        console.print(f"新模型保存: [bold]{train_result.model_path}[/bold]")
-        if train_result.label_encoder_path:
-            console.print(f"类别映射保存: [bold]{train_result.label_encoder_path}[/bold]")
+        console.print(table)
 
-        tracker = MetricsTracker(output_dir=cfg.output.output_dir)
-        tracker.load_history()
-        current_iter = tracker.next_iteration
-        tracker.add(
-            iteration=current_iter,
-            labeled_count=len(X_labeled),
-            accuracy=train_result.accuracy,
-            f1_macro=train_result.f1_macro,
-            selected_count=cfg.sampler.budget,
-            model_path=train_result.model_path,
-        )
-        metrics_path = tracker.save_history()
-        console.print(f"[green]✓[/green] 第 [bold]{current_iter}[/bold] 轮指标保存: [bold]{metrics_path}[/bold]")
+        exporter = CSVExporter(output_dir=cfg.output.output_dir)
+        csv_path = exporter.export(selection)
+        console.print(f"[green]✓[/green] 下一轮待标注 CSV: [bold]{csv_path}[/bold]")
+        run.output_csv = csv_path
 
         if cfg.output.export_visualization:
             visualizer = Visualizer(output_dir=cfg.output.output_dir)
-            curve_path = visualizer.plot_learning_curve(
-                iterations=tracker.iterations,
-                labeled_counts=tracker.labeled_counts,
-                accuracies=tracker.accuracies,
-                f1_scores=tracker.f1_scores,
+            labeled_mask_viz = np.array([_is_valid_label(l) for l in all_labels])
+            feat_path = visualizer.plot_feature_space(
+                features=features,
+                labeled_mask=labeled_mask_viz,
+                selected_indices=selection.indices,
+                labels=np.array(all_labels) if all_labels is not None else None,
             )
-            console.print(f"[green]✓[/green] 学习曲线: [bold]{curve_path}[/bold]")
+            console.print(f"[green]✓[/green] 特征空间图: [bold]{feat_path}[/bold]")
+            run.output_visualization = feat_path
 
-        new_model_path = train_result.model_path
-    else:
-        if not cfg.train.enabled:
-            console.print("[yellow]训练已禁用[/yellow]")
-        else:
-            console.print("[yellow]标注样本不足，跳过训练[/yellow]")
-        new_model_path = str(model_path)
+        run_status = "success"
 
-    console.print("[cyan]开始下一轮采样...")
-    loaded_new = ModelLoader.load(
-        model_path=new_model_path,
-        model_type=cfg.model.model_type,
-        num_classes=cfg.model.num_classes,
-        device=device,
-    )
-    predictor = Predictor(loaded_new)
-
-    try:
-        with Progress(console=console) as progress:
-            pred_task = progress.add_task("[magenta]模型推理...", total=len(features))
-            probs = _predict_probs(predictor, features, cfg.model.batch_size, progress, pred_task)
-    except Exception as e:
-        console.print(f"[bold red]✗ 下一轮采样推理失败:[/bold red] {e}")
-        console.print("[yellow]已停止执行，未导出待标注 CSV，请检查模型。[/yellow]")
-        raise click.ClickException(f"下一轮采样推理失败: {e}")
-
-    budget = cfg.sampler.budget
-    strategy_name = cfg.sampler.strategy
-    u_scores = np.zeros(len(features), dtype=np.float32)
-    d_scores = np.zeros(len(features), dtype=np.float32)
-    hybrid_scores = np.zeros(len(features), dtype=np.float32)
-    reasons = [""] * len(features)
-
-    if strategy_name == "uncertainty":
-        sampler = UncertaintySampler(method=cfg.sampler.uncertainty_method)
-        result = sampler.score(probs)
-        u_scores = result.scores
-        hybrid_scores = u_scores
-        for i in range(len(reasons)):
-            reasons[i] = f"不确定性({cfg.sampler.uncertainty_method})"
-    elif strategy_name == "diversity":
-        sampler = DiversitySampler(num_clusters=cfg.sampler.num_clusters or budget, seed=cfg.seed)
-        div_result = sampler.score(features, budget)
-        d_scores = div_result.scores
-        hybrid_scores = d_scores
-        for i in range(len(reasons)):
-            reasons[i] = "多样性(KMeans)"
-    elif strategy_name == "qbc":
-        sampler = QBCSampler(seed=cfg.seed)
-        valid_mask = np.array([_is_valid_label(l) for l in all_labels])
-        X_train_qbc = features[valid_mask] if valid_mask.any() else None
-        y_train_qbc = np.array([l for l, v in zip(all_labels, valid_mask) if v]) if valid_mask.any() else None
-        qbc_result = sampler.score(features, X_train_qbc, y_train_qbc, predictor)
-        hybrid_scores = qbc_result.scores
-        u_scores = hybrid_scores
-        d_scores = np.zeros_like(hybrid_scores)
-        for i in range(len(reasons)):
-            reasons[i] = "委员会投票(QBC)"
-    else:
-        sampler = HybridSampler(
-            uncertainty_method=cfg.sampler.uncertainty_method,
-            uncertainty_weight=cfg.sampler.uncertainty_weight,
-            diversity_weight=cfg.sampler.diversity_weight,
-            num_clusters=cfg.sampler.num_clusters or budget,
-            seed=cfg.seed,
-        )
-        h_result = sampler.score(probs, features, budget)
-        u_scores = h_result.uncertainty_scores
-        d_scores = h_result.diversity_scores
-        hybrid_scores = h_result.scores
-        for i in range(len(reasons)):
-            reasons[i] = HybridSampler.get_reason(
-                float(u_scores[i]),
-                float(d_scores[i]),
-                cfg.sampler.uncertainty_weight,
-                cfg.sampler.diversity_weight,
+        console.print(Panel.fit(
+            "[bold green]迭代完成![/bold green]\n"
+            f"输出目录: [bold]{cfg.output.output_dir}[/bold]",
+            border_style="green",
+        ))
+    finally:
+        if "run" in locals():
+            tracker.finish_run(
+                run,
+                status=run_status,
+                error_message=err_msg,
+                output_csv=csv_path,
+                output_visualization=feat_path,
+                output_learning_curve=curve_path,
+                model_path=final_model_path,
+                class_names=class_names,
+                total_samples=total_samples,
+                labeled_samples=labeled_samples,
             )
-
-    selector = BatchSelector(budget=budget, seed=cfg.seed)
-    selection = selector.select(
-        scores=hybrid_scores,
-        features=features,
-        uncertainty_scores=u_scores,
-        diversity_scores=d_scores,
-        file_paths=file_paths,
-        probs=probs,
-        u_weight=cfg.sampler.uncertainty_weight,
-        d_weight=cfg.sampler.diversity_weight,
-    )
-
-    table = _display_table(
-        selection.indices, file_paths, u_scores, d_scores, reasons, cfg.output.top_k_display,
-    )
-    console.print(table)
-
-    exporter = CSVExporter(output_dir=cfg.output.output_dir)
-    csv_path = exporter.export(selection)
-    console.print(f"[green]✓[/green] 下一轮待标注 CSV: [bold]{csv_path}[/bold]")
-
-    console.print(Panel.fit(
-        "[bold green]迭代完成![/bold green]\n"
-        f"输出目录: [bold]{cfg.output.output_dir}[/bold]",
-        border_style="green",
-    ))
 
 
 @cli.command(help="预检查模式：验证数据/模型/配置是否就绪，不执行训练和导出")
@@ -809,9 +1011,11 @@ def dry_run(config: str, labels: Optional[str]):
         device="cpu",
     )
     latest_le = trainer.get_latest_label_encoder()
+    le_classes: Optional[list] = None
     if latest_le is not None:
         try:
             le = Trainer.load_label_encoder(latest_le)
+            le_classes = list(le.classes_)
             console.print(f"  [green]✓[/green] 类别映射: [bold]{latest_le}[/bold] ({len(le.classes_)} 类: {list(le.classes_)})")
             checks_passed += 1
         except Exception as e:
@@ -820,6 +1024,75 @@ def dry_run(config: str, labels: Optional[str]):
     else:
         console.print("  [dim]无已有类别映射，首次训练将自动生成[/dim]")
         checks_passed += 1
+
+    num_classes_cfg = cfg.model.num_classes
+    labels_classes: Optional[list] = None
+    if labels:
+        labels_path = Path(labels)
+        try:
+            import chardet as _cd2
+            with open(labels_path, "rb") as f:
+                enc2 = _cd2.detect(f.read(65536)).get("encoding", "utf-8") or "utf-8"
+            labels_df_check = pd.read_csv(labels_path, encoding=enc2)
+            lower_cols2 = {c.lower(): c for c in labels_df_check.columns}
+            label_col2 = None
+            for cand in ["label", "category", "class", "target", "y"]:
+                if cand in lower_cols2:
+                    label_col2 = lower_cols2[cand]
+                    break
+            if label_col2 is None and len(labels_df_check.columns) > 1:
+                label_col2 = labels_df_check.columns[-1]
+            if label_col2 is not None:
+                valid_labels = [l for l in labels_df_check[label_col2] if _is_valid_label(l)]
+                labels_classes = sorted(list(set(valid_labels)))
+        except Exception:
+            pass
+
+    if labels_classes is None and labels:
+        console.print("  [yellow]⚠[/yellow] 无法从标注 CSV 提取类别，跳过标注类别比较")
+        checks_warned += 1
+    if le_classes is None and latest_le is not None:
+        console.print("  [yellow]⚠[/yellow] 已有 label_encoder 无法加载，跳过映射类别比较")
+        checks_warned += 1
+
+    tri_parts_ok = True
+    if labels_classes is not None and le_classes is not None:
+        if num_classes_cfg != len(labels_classes) or len(labels_classes) != len(le_classes):
+            console.print(f"  [red]✗ 类别数量不一致[/red]: 配置{num_classes_cfg}个 vs 标注{len(labels_classes)}个 vs 已有映射{len(le_classes)}个")
+            checks_failed += 1
+            tri_parts_ok = False
+        labels_set = set(labels_classes)
+        le_set = set(le_classes)
+        if labels_set != le_set:
+            only_labels = labels_set - le_set
+            only_le = le_set - labels_set
+            if only_labels:
+                console.print(f"  [red]✗[/red] 仅标注有、映射无的类别: {list(only_labels)}")
+            if only_le:
+                console.print(f"  [red]✗[/red] 仅映射有、标注无的类别: {list(only_le)}")
+            checks_failed += 1
+            tri_parts_ok = False
+        if tri_parts_ok:
+            console.print("  [green]✓ 类别映射三方一致[/green]")
+            checks_passed += 1
+    elif labels_classes is not None and le_classes is None:
+        console.print("  [yellow]⚠[/yellow] 无已有 label_encoder，仅检查配置与标注")
+        checks_warned += 1
+        if num_classes_cfg != len(labels_classes):
+            console.print(f"  [red]✗ 类别数量不一致[/red]: 配置{num_classes_cfg}个 vs 标注{len(labels_classes)}个")
+            checks_failed += 1
+        else:
+            console.print("  [green]✓ 配置与标注类别一致[/green]")
+            checks_passed += 1
+    elif labels_classes is None and le_classes is not None:
+        console.print("  [yellow]⚠[/yellow] 未传标注 CSV，仅检查配置与已有映射")
+        checks_warned += 1
+        if num_classes_cfg != len(le_classes):
+            console.print(f"  [red]✗ 类别数量不一致[/red]: 配置{num_classes_cfg}个 vs 已有映射{len(le_classes)}个")
+            checks_failed += 1
+        else:
+            console.print("  [green]✓ 配置与已有映射类别一致[/green]")
+            checks_passed += 1
 
     console.print("\n[bold]5. 输出目录检查[/bold]")
     output_dir = Path(cfg.output.output_dir)
@@ -850,7 +1123,69 @@ def dry_run(config: str, labels: Optional[str]):
         console.print("  [dim]无历史指标，首次迭代将从第 1 轮开始[/dim]")
         checks_passed += 1
 
-    console.print(f"\n[bold]预计处理样本数:[/bold] {n_total} 个未标注样本, 采样预算 {cfg.sampler.budget} 个/轮")
+    if "dataset" in locals() and dataset is not None:
+        n_total = len(raw_items)
+        n_existing_labeled = sum(1 for l in (existing_labels or []) if _is_valid_label(l))
+        n_new_labels = 0
+        n_overlap = 0
+        if labels:
+            try:
+                import chardet as _cd3
+                labels_path3 = Path(labels)
+                with open(labels_path3, "rb") as f:
+                    enc3 = _cd3.detect(f.read(65536)).get("encoding", "utf-8") or "utf-8"
+                labels_df3 = pd.read_csv(labels_path3, encoding=enc3)
+                lower_cols3 = {c.lower(): c for c in labels_df3.columns}
+                path_col3 = None
+                label_col3 = None
+                for cand in ["path", "file_path", "file", "image", "audio", "sample"]:
+                    if cand in lower_cols3:
+                        path_col3 = lower_cols3[cand]
+                        break
+                if path_col3 is None and len(labels_df3.columns) > 0:
+                    path_col3 = labels_df3.columns[0]
+                for cand in ["label", "category", "class", "target", "y"]:
+                    if cand in lower_cols3:
+                        label_col3 = lower_cols3[cand]
+                        break
+                if label_col3 is None and len(labels_df3.columns) > 1:
+                    label_col3 = labels_df3.columns[-1]
+
+                if path_col3 and label_col3:
+                    valid_count = 0
+                    norm_file_paths = {str(fp).replace("\\", "/"): i for i, fp in enumerate(file_paths)}
+                    existing_labeled_set = set()
+                    for i, l in enumerate(existing_labels or []):
+                        if _is_valid_label(l) and i < len(file_paths):
+                            existing_labeled_set.add(str(file_paths[i]).replace("\\", "/"))
+                    for _, row in labels_df3.iterrows():
+                        lbl3 = row[label_col3]
+                        if _is_valid_label(lbl3):
+                            valid_count += 1
+                            fp3 = str(row[path_col3]).replace("\\", "/")
+                            if fp3 in existing_labeled_set:
+                                n_overlap += 1
+                    n_new_labels = valid_count
+            except Exception:
+                pass
+
+        n_unlabeled = n_total - n_existing_labeled
+        n_new_unique = n_new_labels - n_overlap
+        n_available_for_sampling = n_total - n_existing_labeled - n_new_unique
+
+        stat_table = Table(show_lines=False)
+        stat_table.add_column("统计项", style="cyan")
+        stat_table.add_column("数量", justify="right", style="white")
+        stat_table.add_row("总样本数", str(n_total))
+        stat_table.add_row("已有标注", str(n_existing_labeled))
+        stat_table.add_row("本次新增标注", f"{n_new_labels} (其中去重后 {n_new_unique})")
+        stat_table.add_row("预计参与采样", str(max(0, n_available_for_sampling)))
+
+        console.print("\n[bold]样本统计:[/bold]")
+        console.print(stat_table)
+
+        if max(0, n_available_for_sampling) < cfg.sampler.budget:
+            console.print(f"  [yellow]⚠[/yellow] 可采样样本数({max(0, n_available_for_sampling)})不足采样预算({cfg.sampler.budget})")
 
     console.print(Panel.fit(
         f"[bold]检查结果:[/bold] "

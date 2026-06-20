@@ -20,8 +20,41 @@ class IterationMetric:
     extra: dict = field(default_factory=dict)
 
 
+@dataclass
+class RunRecord:
+    run_id: str
+    command: str
+    start_time: str
+    end_time: Optional[str] = None
+    duration_sec: Optional[float] = None
+    status: str = "running"
+    config_path: Optional[str] = None
+    config_summary: dict = field(default_factory=dict)
+    model_path: Optional[str] = None
+    model_type: Optional[str] = None
+    num_classes: Optional[int] = None
+    label_encoder_path: Optional[str] = None
+    class_names: list = field(default_factory=list)
+    sampler_strategy: Optional[str] = None
+    sampler_uncertainty_method: Optional[str] = None
+    sampler_uncertainty_weight: Optional[float] = None
+    sampler_diversity_weight: Optional[float] = None
+    budget: Optional[int] = None
+    data_type: Optional[str] = None
+    data_path: Optional[str] = None
+    total_samples: Optional[int] = None
+    labeled_samples: Optional[int] = None
+    output_csv: Optional[str] = None
+    output_visualization: Optional[str] = None
+    output_learning_curve: Optional[str] = None
+    output_dir: Optional[str] = None
+    error_message: Optional[str] = None
+    extra: dict = field(default_factory=dict)
+
+
 class MetricsTracker:
     DEFAULT_FILENAME = "metrics_history.json"
+    RUNS_FILENAME = "runs_history.json"
 
     def __init__(
         self,
@@ -30,6 +63,77 @@ class MetricsTracker:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.metrics: list[IterationMetric] = []
+        self.runs: list[RunRecord] = []
+
+    def create_run(
+        self,
+        command: str,
+        config_path: Optional[str] = None,
+        **kwargs,
+    ) -> RunRecord:
+        run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        run = RunRecord(
+            run_id=run_id,
+            command=command,
+            start_time=datetime.datetime.now().isoformat(),
+            config_path=config_path,
+            **kwargs,
+        )
+        self.runs.append(run)
+        return run
+
+    def finish_run(
+        self,
+        run: RunRecord,
+        status: str = "success",
+        error_message: Optional[str] = None,
+        **kwargs,
+    ) -> RunRecord:
+        run.end_time = datetime.datetime.now().isoformat()
+        try:
+            start_dt = datetime.datetime.fromisoformat(run.start_time)
+            end_dt = datetime.datetime.fromisoformat(run.end_time)
+            run.duration_sec = round((end_dt - start_dt).total_seconds(), 3)
+        except Exception:
+            run.duration_sec = None
+        run.status = status
+        run.error_message = error_message
+        for k, v in kwargs.items():
+            if hasattr(run, k):
+                setattr(run, k, v)
+            else:
+                run.extra[k] = v
+        self.save_runs()
+        return run
+
+    def runs_history_path(self) -> Path:
+        return self.output_dir / self.RUNS_FILENAME
+
+    def load_runs(self) -> list[RunRecord]:
+        hp = self.runs_history_path()
+        if not hp.exists():
+            return self.runs
+        with open(hp, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.runs = []
+        import dataclasses as _dc
+
+        field_names = {f.name for f in _dc.fields(RunRecord)}
+        for d in data:
+            run_kwargs = {k: v for k, v in d.items() if k in field_names}
+            self.runs.append(RunRecord(**run_kwargs))
+        return self.runs
+
+    def save_runs(self) -> str:
+        import dataclasses as _dc
+
+        output_path = self.runs_history_path()
+        data = []
+        for r in self.runs:
+            data.append(_dc.asdict(r))
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return str(output_path)
 
     def add(
         self,

@@ -1,0 +1,39 @@
+[
+  {
+    "run_id": "20260621_053503_029344",
+    "command": "select",
+    "start_time": "2026-06-21T05:35:03.029377",
+    "end_time": "2026-06-21T05:35:17.353383",
+    "duration_sec": 14.324,
+    "status": "success",
+    "config_path": "data\\sample_config.yaml",
+    "config_summary": {
+      "data_type": "text",
+      "num_classes": 4,
+      "seed": 42
+    },
+    "model_path": "checkpoints\\dummy_model.pkl",
+    "model_type": "sklearn",
+    "num_classes": 4,
+    "label_encoder_path": "checkpoints\\label_encoder_20260621_050745.joblib",
+    "class_names": [
+      "negative",
+      "positive"
+    ],
+    "sampler_strategy": "hybrid",
+    "sampler_uncertainty_method": "entropy",
+    "sampler_uncertainty_weight": 0.6,
+    "sampler_diversity_weight": 0.4,
+    "budget": 20,
+    "data_type": "text",
+    "data_path": "./data/sample_unlabeled.csv",
+    "total_samples": 20,
+    "labeled_samples": 0,
+    "output_csv": "outputs\\selected_samples_20260621_053516.csv",
+    "output_visualization": "outputs\\feature_space_20260621_053517.html",
+    "output_learning_curve": null,
+    "output_dir": "./outputs",
+    "error_message": null,
+    "extra": {}
+  }
+]

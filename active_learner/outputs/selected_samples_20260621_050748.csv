@@ -1,6 +1,0 @@
-﻿file_path,uncertainty_score,diversity_score,recommended_reason
-active_learner\data\sample_unlabeled.csv:17,0.9998775124549866,0.3064379096031189,高不确定性
-active_learner\data\sample_unlabeled.csv:14,0.9690273404121399,0.30445247888565063,高不确定性
-active_learner\data\sample_unlabeled.csv:19,0.9400584101676941,0.33125513792037964,高不确定性
-active_learner\data\sample_unlabeled.csv:18,0.9024872183799744,0.37201330065727234,高不确定性
-active_learner\data\sample_unlabeled.csv:20,0.7437441945075989,0.464293897151947,高不确定性
