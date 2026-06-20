@@ -1,0 +1,11 @@
+[
+  {
+    "iteration": 1,
+    "labeled_count": 12,
+    "accuracy": 1.0,
+    "f1_macro": 1.0,
+    "selected_count": 5,
+    "model_path": "active_learner\\checkpoints\\model_sklearn_20260621_045308.pkl",
+    "extra": {}
+  }
+]

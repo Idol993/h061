@@ -144,7 +144,7 @@ class TextLoader:
         for csv_file in csv_files:
             ds = self.load_csv(csv_file)
             all_texts.extend(ds.texts)
-            all_paths.extend([str(csv_file)] * len(ds.texts))
+            all_paths.extend(ds.file_paths)
             if ds.labels is not None:
                 all_labels.extend(ds.labels)
             else:
@@ -153,13 +153,13 @@ class TextLoader:
         for txt_file in txt_files:
             ds = self.load_txt(txt_file)
             all_texts.extend(ds.texts)
-            all_paths.extend([str(txt_file)] * len(ds.texts))
+            all_paths.extend(ds.file_paths)
             has_labels = False
 
         for json_file in json_files + jsonl_files:
             ds = self.load_json(json_file)
             all_texts.extend(ds.texts)
-            all_paths.extend([str(json_file)] * len(ds.texts))
+            all_paths.extend(ds.file_paths)
             if ds.labels is not None:
                 all_labels.extend(ds.labels)
             else:

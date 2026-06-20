@@ -15,6 +15,7 @@ class TrainResult:
     epochs_trained: int
     model_path: str
     history: dict
+    label_encoder_path: Optional[str] = None
 
 
 class Trainer:
@@ -43,10 +44,40 @@ class Trainer:
         return device
 
     def _get_latest_checkpoint(self) -> Optional[Path]:
-        ckpt_files = list(self.checkpoint_dir.glob("*.pth"))
+        ckpt_files = list(self.checkpoint_dir.glob("*.pth")) + list(self.checkpoint_dir.glob("*.pkl"))
         if not ckpt_files:
             return None
         return max(ckpt_files, key=lambda p: p.stat().st_mtime)
+
+    def get_latest_label_encoder(self) -> Optional[Path]:
+        le_files = list(self.checkpoint_dir.glob("label_encoder*.joblib"))
+        if not le_files:
+            return None
+        return max(le_files, key=lambda p: p.stat().st_mtime)
+
+    @staticmethod
+    def load_label_encoder(path: str | Path):
+        import joblib
+
+        return joblib.load(path)
+
+    def _fit_label_encoder(self, y_train: np.ndarray, y_val: Optional[np.ndarray] = None):
+        from sklearn.preprocessing import LabelEncoder
+
+        le = LabelEncoder()
+        all_y = list(y_train)
+        if y_val is not None:
+            all_y.extend(list(y_val))
+        le.fit(all_y)
+        return le
+
+    def _save_label_encoder(self, le) -> str:
+        import joblib
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        le_path = self.checkpoint_dir / f"label_encoder_{timestamp}.joblib"
+        joblib.dump(le, le_path)
+        return str(le_path)
 
     def resume(self) -> Optional[Path]:
         return self._get_latest_checkpoint()
@@ -186,8 +217,10 @@ class Trainer:
             else:
                 model.eval()
                 all_preds = []
+                eval_dataset = TensorDataset(X_tensor, y_tensor)
+                eval_loader = DataLoader(eval_dataset, batch_size=64, shuffle=False)
                 with torch.no_grad():
-                    for batch_X, _ in train_loader:
+                    for batch_X, _ in eval_loader:
                         batch_X = batch_X.to(self.device)
                         outputs = model(batch_X)
                         if isinstance(outputs, (tuple, list)):
@@ -243,42 +276,69 @@ class Trainer:
         learning_rate: float = 1e-4,
         early_stopping_patience: int = 3,
         freeze_backbone: bool = True,
+        existing_label_encoder=None,
     ) -> TrainResult:
-        y_train = np.asarray(y_train).astype(int)
+        y_train = np.asarray(y_train)
         if X_val is not None and y_val is not None:
-            y_val = np.asarray(y_val).astype(int)
+            y_val = np.asarray(y_val)
+
+        if existing_label_encoder is not None:
+            try:
+                _ = existing_label_encoder.transform(y_train)
+                if y_val is not None:
+                    _ = existing_label_encoder.transform(y_val)
+                le = existing_label_encoder
+            except Exception:
+                le = self._fit_label_encoder(y_train, y_val)
+        else:
+            le = self._fit_label_encoder(y_train, y_val)
+
+        y_train_enc = le.transform(y_train)
+        y_val_enc = le.transform(y_val) if y_val is not None else None
+
+        unique_classes = list(le.classes_)
+        if len(unique_classes) != self.num_classes:
+            self.num_classes = len(unique_classes)
+
+        le_path = self._save_label_encoder(le)
 
         if model_type == "sklearn":
-            return self._train_sklearn(
+            result = self._train_sklearn(
                 base_model=base_model,
                 X_train=X_train,
-                y_train=y_train,
+                y_train=y_train_enc,
                 X_val=X_val,
-                y_val=y_val,
+                y_val=y_val_enc,
                 epochs=epochs,
                 early_stopping_patience=early_stopping_patience,
             )
+            result.label_encoder_path = le_path
+            return result
         elif model_type == "pytorch":
-            return self._train_pytorch(
+            result = self._train_pytorch(
                 base_model=base_model,
                 X_train=X_train,
-                y_train=y_train,
+                y_train=y_train_enc,
                 X_val=X_val,
-                y_val=y_val,
+                y_val=y_val_enc,
                 epochs=epochs,
                 learning_rate=learning_rate,
                 early_stopping_patience=early_stopping_patience,
                 freeze_backbone=freeze_backbone,
             )
+            result.label_encoder_path = le_path
+            return result
         else:
             if hasattr(base_model, "fit") or hasattr(base_model, "train"):
-                return self._train_sklearn(
+                result = self._train_sklearn(
                     base_model=base_model,
                     X_train=X_train,
-                    y_train=y_train,
+                    y_train=y_train_enc,
                     X_val=X_val,
-                    y_val=y_val,
+                    y_val=y_val_enc,
                     epochs=epochs,
                     early_stopping_patience=early_stopping_patience,
                 )
+                result.label_encoder_path = le_path
+                return result
             raise ValueError(f"不支持重训练的模型类型: {model_type}")

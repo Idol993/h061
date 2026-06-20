@@ -1,0 +1,11 @@
+﻿file_path,uncertainty_score,diversity_score,recommended_reason
+active_learner\data\sample_unlabeled.csv:7,1.0,0.0,高不确定性
+active_learner\data\sample_unlabeled.csv:14,0.9771294593811035,0.0,高不确定性
+active_learner\data\sample_unlabeled.csv:20,0.9585925340652466,0.0,高不确定性
+active_learner\data\sample_unlabeled.csv:11,0.9281994104385376,0.0,高不确定性
+active_learner\data\sample_unlabeled.csv:12,0.8993132710456848,0.0,高不确定性
+active_learner\data\sample_unlabeled.csv:9,0.8959736227989197,0.0,高不确定性
+active_learner\data\sample_unlabeled.csv:19,0.8869269490242004,0.0,高不确定性
+active_learner\data\sample_unlabeled.csv:10,0.8318042159080505,0.0,高不确定性
+active_learner\data\sample_unlabeled.csv:17,0.8178080320358276,0.0,高不确定性
+active_learner\data\sample_unlabeled.csv:2,0.800636887550354,0.0,高不确定性

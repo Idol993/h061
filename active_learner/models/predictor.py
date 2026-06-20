@@ -79,11 +79,10 @@ class Predictor:
             if all_probs:
                 return np.concatenate(all_probs, axis=0).astype(np.float32)
 
-        except Exception:
-            pass
+            raise RuntimeError("PyTorch 推理输出为空")
 
-        rng = np.random.RandomState(42)
-        return rng.dirichlet(np.ones(self.num_classes), size=len(features)).astype(np.float32)
+        except Exception as e:
+            raise RuntimeError(f"PyTorch 模型推理失败: {e}") from e
 
     def _predict_onnx(self, features: np.ndarray) -> np.ndarray:
         try:
@@ -107,19 +106,19 @@ class Predictor:
                     probs = exp_p / exp_p.sum(axis=1, keepdims=True)
 
                 if probs.shape[1] != self.num_classes:
-                    rng = np.random.RandomState(42)
-                    probs = rng.dirichlet(np.ones(self.num_classes), size=len(batch)).astype(np.float32)
+                    raise RuntimeError(
+                        f"ONNX 模型输出类别数({probs.shape[1]})与配置 num_classes({self.num_classes})不匹配"
+                    )
 
                 all_probs.append(probs.astype(np.float32))
 
             if all_probs:
                 return np.concatenate(all_probs, axis=0)
 
-        except Exception:
-            pass
+            raise RuntimeError("ONNX 推理输出为空")
 
-        rng = np.random.RandomState(42)
-        return rng.dirichlet(np.ones(self.num_classes), size=len(features)).astype(np.float32)
+        except Exception as e:
+            raise RuntimeError(f"ONNX 模型推理失败: {e}") from e
 
     def predict_proba(
         self,

@@ -1,0 +1,13 @@
+file_path,label
+active_learner/data/sample_unlabeled.csv:2,positive
+active_learner/data/sample_unlabeled.csv:3,negative
+active_learner/data/sample_unlabeled.csv:4,positive
+active_learner/data/sample_unlabeled.csv:5,negative
+active_learner/data/sample_unlabeled.csv:6,positive
+active_learner/data/sample_unlabeled.csv:7,negative
+active_learner/data/sample_unlabeled.csv:8,positive
+active_learner/data/sample_unlabeled.csv:9,negative
+active_learner/data/sample_unlabeled.csv:10,positive
+active_learner/data/sample_unlabeled.csv:11,negative
+active_learner/data/sample_unlabeled.csv:12,positive
+active_learner/data/sample_unlabeled.csv:13,negative

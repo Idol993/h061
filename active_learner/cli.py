@@ -7,6 +7,7 @@ from typing import Optional
 
 import click
 import numpy as np
+import pandas as pd
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import (
@@ -38,6 +39,25 @@ def _resolve_device(device_str: str) -> str:
         except ImportError:
             return "cpu"
     return device_str
+
+
+def _is_valid_label(l) -> bool:
+    if l is None:
+        return False
+    if isinstance(l, (int, np.integer)):
+        return l != -1
+    if isinstance(l, float):
+        if np.isnan(l):
+            return False
+        return l != -1.0
+    if isinstance(l, str):
+        return l.strip() != ""
+    try:
+        if pd.isna(l):
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def _load_dataset(config, console: Console):
@@ -222,18 +242,23 @@ def select(config: str, budget: Optional[int], strategy: Optional[str], output_d
 
     predictor = Predictor(loaded_model)
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    ) as progress:
-        pred_task = progress.add_task("[magenta]模型推理...", total=len(features))
-        probs = _predict_probs(predictor, features, cfg.model.batch_size, progress, pred_task,
-        )
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            pred_task = progress.add_task("[magenta]模型推理...", total=len(features))
+            probs = _predict_probs(predictor, features, cfg.model.batch_size, progress, pred_task,
+            )
+    except Exception as e:
+        console.print(f"[bold red]✗ 模型推理失败:[/bold red] {e}")
+        console.print("[yellow]已停止执行，未导出待标注 CSV，请检查模型输入维度/格式是否匹配。[/yellow]")
+        raise click.ClickException(f"模型推理失败: {e}")
 
     console.print(f"[green]✓[/green] 推理完成")
 
@@ -295,7 +320,7 @@ def select(config: str, budget: Optional[int], strategy: Optional[str], output_d
             X_train = None
             y_train = None
             if labels is not None and len(labels) > 0:
-                valid_mask = np.array([l is not None and l != -1 for l in labels])
+                valid_mask = np.array([_is_valid_label(l) for l in labels])
                 if valid_mask.any():
                     X_train = features[valid_mask]
                     y_train = np.array([l for l, v in zip(labels, valid_mask) if v])
@@ -339,7 +364,7 @@ def select(config: str, budget: Optional[int], strategy: Optional[str], output_d
         visualizer = Visualizer(output_dir=cfg.output.output_dir)
         labeled_mask = None
         if labels is not None:
-            labeled_mask = np.array([l is not None and l != -1 for l in labels])
+            labeled_mask = np.array([_is_valid_label(l) for l in labels])
         feat_path = visualizer.plot_feature_space(
             features=features,
             labeled_mask=labeled_mask,
@@ -435,25 +460,26 @@ def iterate(config: str, labels: str, resume: bool, output_dir: Optional[str]):
 
     new_labels_map = {}
     for _, row in labels_df.iterrows():
-        fp = str(row[path_col])
+        fp = str(row[path_col]).replace("\\", "/")
         lbl = row[label_col]
         new_labels_map[fp] = lbl
 
     all_labels = [None] * len(file_paths)
     for i, fp in enumerate(file_paths):
-        if fp in new_labels_map:
-            all_labels[i] = new_labels_map[fp]
+        norm_fp = fp.replace("\\", "/")
+        if norm_fp in new_labels_map:
+            all_labels[i] = new_labels_map[norm_fp]
 
     if existing_labels is not None:
         for i in range(len(existing_labels)):
-            if existing_labels[i] is not None and existing_labels[i] != -1:
+            if _is_valid_label(existing_labels[i]):
                 all_labels[i] = existing_labels[i]
 
     with Progress(console=console) as progress:
         feat_task = progress.add_task("[cyan]提取特征...", total=len(dataset))
         features = _extract_features(raw_items, cfg.data.data_type, device, progress, feat_task, cfg.model.batch_size)
 
-    labeled_mask = np.array([l is not None and l != -1 for l in all_labels])
+    labeled_mask = np.array([_is_valid_label(l) for l in all_labels])
     X_labeled = features[labeled_mask]
     y_labeled = np.array([l for l, v in zip(all_labels, labeled_mask) if v])
 
@@ -487,6 +513,15 @@ def iterate(config: str, labels: str, resume: bool, output_dir: Optional[str]):
             device=device,
         )
 
+        existing_le = None
+        latest_le_path = trainer.get_latest_label_encoder()
+        if latest_le_path is not None:
+            try:
+                existing_le = Trainer.load_label_encoder(latest_le_path)
+                console.print(f"[green]✓[/green] 复用已有类别映射: [bold]{latest_le_path}[/bold] ({len(existing_le.classes_)} 类)")
+            except Exception as e:
+                console.print(f"[yellow]警告: 加载已有 label_encoder 失败，将重新生成: {e}[/yellow]")
+
         from sklearn.model_selection import train_test_split
 
         if len(X_labeled) > 50:
@@ -508,6 +543,7 @@ def iterate(config: str, labels: str, resume: bool, output_dir: Optional[str]):
             learning_rate=cfg.train.learning_rate,
             early_stopping_patience=cfg.train.early_stopping_patience,
             freeze_backbone=cfg.train.freeze_backbone,
+            existing_label_encoder=existing_le,
         )
 
         console.print(
@@ -515,6 +551,8 @@ def iterate(config: str, labels: str, resume: bool, output_dir: Optional[str]):
             f"F1 [bold]{train_result.f1_macro:.4f}[/bold]"
         )
         console.print(f"新模型保存: [bold]{train_result.model_path}[/bold]")
+        if train_result.label_encoder_path:
+            console.print(f"类别映射保存: [bold]{train_result.label_encoder_path}[/bold]")
 
         tracker = MetricsTracker(output_dir=cfg.output.output_dir)
         tracker.add(
@@ -555,9 +593,14 @@ def iterate(config: str, labels: str, resume: bool, output_dir: Optional[str]):
     )
     predictor = Predictor(loaded_new)
 
-    with Progress(console=console) as progress:
-        pred_task = progress.add_task("[magenta]模型推理...", total=len(features))
-        probs = _predict_probs(predictor, features, cfg.model.batch_size, progress, pred_task)
+    try:
+        with Progress(console=console) as progress:
+            pred_task = progress.add_task("[magenta]模型推理...", total=len(features))
+            probs = _predict_probs(predictor, features, cfg.model.batch_size, progress, pred_task)
+    except Exception as e:
+        console.print(f"[bold red]✗ 下一轮采样推理失败:[/bold red] {e}")
+        console.print("[yellow]已停止执行，未导出待标注 CSV，请检查模型。[/yellow]")
+        raise click.ClickException(f"下一轮采样推理失败: {e}")
 
     budget = cfg.sampler.budget
     strategy_name = cfg.sampler.strategy
@@ -580,6 +623,17 @@ def iterate(config: str, labels: str, resume: bool, output_dir: Optional[str]):
         hybrid_scores = d_scores
         for i in range(len(reasons)):
             reasons[i] = "多样性(KMeans)"
+    elif strategy_name == "qbc":
+        sampler = QBCSampler(seed=cfg.seed)
+        valid_mask = np.array([_is_valid_label(l) for l in all_labels])
+        X_train_qbc = features[valid_mask] if valid_mask.any() else None
+        y_train_qbc = np.array([l for l, v in zip(all_labels, valid_mask) if v]) if valid_mask.any() else None
+        qbc_result = sampler.score(features, X_train_qbc, y_train_qbc, predictor)
+        hybrid_scores = qbc_result.scores
+        u_scores = hybrid_scores
+        d_scores = np.zeros_like(hybrid_scores)
+        for i in range(len(reasons)):
+            reasons[i] = "委员会投票(QBC)"
     else:
         sampler = HybridSampler(
             uncertainty_method=cfg.sampler.uncertainty_method,
