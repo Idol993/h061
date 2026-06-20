@@ -385,26 +385,33 @@ def select(config: str, budget: Optional[int], strategy: Optional[str], output_d
 @click.option("--metrics", "-m", type=click.Path(exists=True), help="指标 JSON 文件路径")
 @click.option("--output-dir", "-o", type=click.Path(), help="输出目录")
 def review(metrics: Optional[str], output_dir: Optional[str]):
-    metrics_path = metrics
     out_dir = Path(output_dir or "outputs")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if metrics_path:
-        tracker = MetricsTracker(output_dir=out_dir)
-        tracker.load(metrics_path)
-        console.print(tracker.summary())
+    tracker = MetricsTracker(output_dir=out_dir)
 
-        if tracker.metrics:
-            visualizer = Visualizer(output_dir=out_dir)
-            curve_path = visualizer.plot_learning_curve(
-                iterations=tracker.iterations,
-                labeled_counts=tracker.labeled_counts,
-                accuracies=tracker.accuracies,
-                f1_scores=tracker.f1_scores,
-            )
-            console.print(f"[green]✓[/green] 学习曲线: [bold]{curve_path}[/bold]")
+    if metrics:
+        tracker.load(metrics)
     else:
-        console.print("[yellow]提示:[/yellow] 请指定 --metrics 参数查看历史指标")
+        hp = tracker.history_path()
+        if hp.exists():
+            tracker.load_history()
+            console.print(f"[dim]自动加载历史指标: {hp}[/dim]")
+        else:
+            console.print("[yellow]提示:[/yellow] 未找到历史指标文件，请先运行 iterate 或指定 --metrics 参数")
+            return
+
+    console.print(tracker.summary())
+
+    if tracker.metrics:
+        visualizer = Visualizer(output_dir=out_dir)
+        curve_path = visualizer.plot_learning_curve(
+            iterations=tracker.iterations,
+            labeled_counts=tracker.labeled_counts,
+            accuracies=tracker.accuracies,
+            f1_scores=tracker.f1_scores,
+        )
+        console.print(f"[green]✓[/green] 学习曲线: [bold]{curve_path}[/bold]")
 
 
 @cli.command(help="用新标注数据重训练模型，并进行下一轮采样")
@@ -555,16 +562,18 @@ def iterate(config: str, labels: str, resume: bool, output_dir: Optional[str]):
             console.print(f"类别映射保存: [bold]{train_result.label_encoder_path}[/bold]")
 
         tracker = MetricsTracker(output_dir=cfg.output.output_dir)
+        tracker.load_history()
+        current_iter = tracker.next_iteration
         tracker.add(
-            iteration=1,
+            iteration=current_iter,
             labeled_count=len(X_labeled),
             accuracy=train_result.accuracy,
             f1_macro=train_result.f1_macro,
             selected_count=cfg.sampler.budget,
             model_path=train_result.model_path,
         )
-        metrics_path = tracker.save()
-        console.print(f"[green]✓[/green] 指标保存: [bold]{metrics_path}[/bold]")
+        metrics_path = tracker.save_history()
+        console.print(f"[green]✓[/green] 第 [bold]{current_iter}[/bold] 轮指标保存: [bold]{metrics_path}[/bold]")
 
         if cfg.output.export_visualization:
             visualizer = Visualizer(output_dir=cfg.output.output_dir)
@@ -680,6 +689,179 @@ def iterate(config: str, labels: str, resume: bool, output_dir: Optional[str]):
         f"输出目录: [bold]{cfg.output.output_dir}[/bold]",
         border_style="green",
     ))
+
+
+@cli.command(help="预检查模式：验证数据/模型/配置是否就绪，不执行训练和导出")
+@click.option("--config", "-c", required=True, type=click.Path(exists=True), help="YAML 配置文件路径")
+@click.option("--labels", "-l", type=click.Path(exists=True), help="标注 CSV 路径（检查标注文件时必传）")
+def dry_run(config: str, labels: Optional[str]):
+    cfg = ConfigParser.load(config)
+    checks_passed = 0
+    checks_failed = 0
+    checks_warned = 0
+
+    console.print(Panel.fit(
+        "[bold cyan]预检查模式 (dry-run)[/bold cyan]",
+        border_style="cyan",
+    ))
+
+    console.print("\n[bold]1. 数据文件检查[/bold]")
+    data_path = Path(cfg.data.data_path)
+    if data_path.exists():
+        try:
+            dataset, file_paths, raw_items, existing_labels = _load_dataset(cfg, console)
+            n_total = len(raw_items)
+            n_labeled = sum(1 for l in (existing_labels or []) if _is_valid_label(l))
+            console.print(f"  [green]✓[/green] 数据文件: [bold]{data_path}[/bold] ({n_total} 个样本, {n_labeled} 个已标注)")
+            checks_passed += 1
+        except Exception as e:
+            console.print(f"  [red]✗[/red] 数据文件加载失败: {e}")
+            checks_failed += 1
+            n_total = 0
+            n_labeled = 0
+    else:
+        console.print(f"  [red]✗[/red] 数据文件不存在: [bold]{data_path}[/bold]")
+        checks_failed += 1
+        n_total = 0
+        n_labeled = 0
+
+    if cfg.data.labeled_path:
+        labeled_path = Path(cfg.data.labeled_path)
+        if labeled_path.exists():
+            console.print(f"  [green]✓[/green] 已标注文件: [bold]{labeled_path}[/bold]")
+            checks_passed += 1
+        else:
+            console.print(f"  [yellow]⚠[/yellow] 已标注文件不存在: [bold]{labeled_path}[/bold]")
+            checks_warned += 1
+
+    console.print("\n[bold]2. 标注文件检查[/bold]")
+    if labels:
+        labels_path = Path(labels)
+        if labels_path.exists():
+            try:
+                import chardet as _cd
+                with open(labels_path, "rb") as f:
+                    enc = _cd.detect(f.read(65536)).get("encoding", "utf-8") or "utf-8"
+                labels_df = pd.read_csv(labels_path, encoding=enc)
+                n_new = len(labels_df)
+
+                lower_cols = {c.lower(): c for c in labels_df.columns}
+                path_col = None
+                label_col = None
+                for cand in ["path", "file_path", "file", "image", "audio", "sample"]:
+                    if cand in lower_cols:
+                        path_col = lower_cols[cand]
+                        break
+                if path_col is None and len(labels_df.columns) > 0:
+                    path_col = labels_df.columns[0]
+                for cand in ["label", "category", "class", "target", "y"]:
+                    if cand in lower_cols:
+                        label_col = lower_cols[cand]
+                        break
+                if label_col is None and len(labels_df.columns) > 1:
+                    label_col = labels_df.columns[-1]
+
+                if path_col and label_col:
+                    unique_labels = labels_df[label_col].dropna().unique()
+                    console.print(f"  [green]✓[/green] 标注文件: [bold]{labels_path}[/bold] ({n_new} 条, {len(unique_labels)} 个类别: {list(unique_labels[:5])}{'...' if len(unique_labels) > 5 else ''})")
+                    checks_passed += 1
+                else:
+                    console.print(f"  [red]✗[/red] 标注文件列名无法识别: {list(labels_df.columns)}")
+                    checks_failed += 1
+            except Exception as e:
+                console.print(f"  [red]✗[/red] 标注文件读取失败: {e}")
+                checks_failed += 1
+        else:
+            console.print(f"  [red]✗[/red] 标注文件不存在: [bold]{labels_path}[/bold]")
+            checks_failed += 1
+    else:
+        console.print("  [dim]未指定 --labels，跳过标注文件检查[/dim]")
+
+    console.print("\n[bold]3. 模型文件检查[/bold]")
+    model_path = Path(cfg.model.model_path)
+    if model_path.exists():
+        try:
+            loaded_model = ModelLoader.load(
+                model_path=model_path,
+                model_type=cfg.model.model_type,
+                num_classes=cfg.model.num_classes,
+                device="cpu",
+            )
+            console.print(f"  [green]✓[/green] 模型文件: [bold]{model_path}[/bold] (类型: {loaded_model.model_type}, 类别数: {loaded_model.num_classes})")
+            checks_passed += 1
+
+            if loaded_model.model_type == "sklearn" and hasattr(loaded_model.model, "n_classes_"):
+                real_n = loaded_model.model.n_classes_
+                if real_n != cfg.model.num_classes:
+                    console.print(f"  [yellow]⚠[/yellow] 模型实际类别数({real_n})与配置 num_classes({cfg.model.num_classes})不一致")
+                    checks_warned += 1
+        except Exception as e:
+            console.print(f"  [red]✗[/red] 模型加载失败: {e}")
+            checks_failed += 1
+    else:
+        console.print(f"  [red]✗[/red] 模型文件不存在: [bold]{model_path}[/bold]")
+        checks_failed += 1
+
+    console.print("\n[bold]4. 类别映射检查[/bold]")
+    trainer = Trainer(
+        num_classes=cfg.model.num_classes,
+        checkpoint_dir=cfg.train.checkpoint_dir,
+        device="cpu",
+    )
+    latest_le = trainer.get_latest_label_encoder()
+    if latest_le is not None:
+        try:
+            le = Trainer.load_label_encoder(latest_le)
+            console.print(f"  [green]✓[/green] 类别映射: [bold]{latest_le}[/bold] ({len(le.classes_)} 类: {list(le.classes_)})")
+            checks_passed += 1
+        except Exception as e:
+            console.print(f"  [yellow]⚠[/yellow] 类别映射加载失败: {e}")
+            checks_warned += 1
+    else:
+        console.print("  [dim]无已有类别映射，首次训练将自动生成[/dim]")
+        checks_passed += 1
+
+    console.print("\n[bold]5. 输出目录检查[/bold]")
+    output_dir = Path(cfg.output.output_dir)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        console.print(f"  [green]✓[/green] 输出目录: [bold]{output_dir}[/bold]")
+        checks_passed += 1
+    except Exception as e:
+        console.print(f"  [red]✗[/red] 输出目录创建失败: {e}")
+        checks_failed += 1
+
+    checkpoint_dir = Path(cfg.train.checkpoint_dir)
+    try:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        console.print(f"  [green]✓[/green] Checkpoint 目录: [bold]{checkpoint_dir}[/bold]")
+        checks_passed += 1
+    except Exception as e:
+        console.print(f"  [red]✗[/red] Checkpoint 目录创建失败: {e}")
+        checks_failed += 1
+
+    console.print("\n[bold]6. 历史指标检查[/bold]")
+    tracker = MetricsTracker(output_dir=cfg.output.output_dir)
+    tracker.load_history()
+    if tracker.metrics:
+        console.print(f"  [green]✓[/green] 已有 {len(tracker.metrics)} 轮历史记录，下一轮为第 [bold]{tracker.next_iteration}[/bold] 轮")
+        checks_passed += 1
+    else:
+        console.print("  [dim]无历史指标，首次迭代将从第 1 轮开始[/dim]")
+        checks_passed += 1
+
+    console.print(f"\n[bold]预计处理样本数:[/bold] {n_total} 个未标注样本, 采样预算 {cfg.sampler.budget} 个/轮")
+
+    console.print(Panel.fit(
+        f"[bold]检查结果:[/bold] "
+        f"[green]{checks_passed} 通过[/green], "
+        f"[yellow]{checks_warned} 警告[/yellow], "
+        f"[red]{checks_failed} 失败[/red]",
+        border_style="green" if checks_failed == 0 else "red",
+    ))
+
+    if checks_failed > 0:
+        raise click.ClickException(f"预检查未通过 ({checks_failed} 项失败)，请修复后重试")
 
 
 @cli.command(help="生成示例配置文件")

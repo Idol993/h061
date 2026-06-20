@@ -21,6 +21,8 @@ class IterationMetric:
 
 
 class MetricsTracker:
+    DEFAULT_FILENAME = "metrics_history.json"
+
     def __init__(
         self,
         output_dir: str | Path = "outputs",
@@ -66,6 +68,24 @@ class MetricsTracker:
     @property
     def f1_scores(self) -> list[float]:
         return [m.f1_macro for m in self.metrics]
+
+    @property
+    def next_iteration(self) -> int:
+        if not self.metrics:
+            return 1
+        return max(m.iteration for m in self.metrics) + 1
+
+    def history_path(self) -> Path:
+        return self.output_dir / self.DEFAULT_FILENAME
+
+    def load_history(self) -> list[IterationMetric]:
+        hp = self.history_path()
+        if hp.exists():
+            self.load(hp)
+        return self.metrics
+
+    def save_history(self) -> str:
+        return self.save(self.DEFAULT_FILENAME)
 
     def save(self, filename: Optional[str] = None) -> str:
         if filename is None:

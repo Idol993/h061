@@ -70,9 +70,10 @@ class Predictor:
                     if isinstance(outputs, (tuple, list)):
                         outputs = outputs[0]
                     if outputs.shape[1] != self.num_classes:
-                        in_feat = outputs.shape[1]
-                        fc = torch.nn.Linear(in_feat, self.num_classes).to(self.device)
-                        outputs = fc(outputs)
+                        raise RuntimeError(
+                            f"PyTorch 模型输出类别数({outputs.shape[1]})与配置 num_classes({self.num_classes})不匹配，"
+                            f"请检查模型最后一层维度或配置中的 num_classes 参数"
+                        )
                     probs = torch.softmax(outputs, dim=1)
                     all_probs.append(probs.cpu().numpy())
 
@@ -81,6 +82,8 @@ class Predictor:
 
             raise RuntimeError("PyTorch 推理输出为空")
 
+        except RuntimeError:
+            raise
         except Exception as e:
             raise RuntimeError(f"PyTorch 模型推理失败: {e}") from e
 
@@ -139,11 +142,10 @@ class Predictor:
 
         probs = np.asarray(probs, dtype=np.float32)
         if probs.shape[1] != self.num_classes:
-            if probs.shape[1] > self.num_classes:
-                probs = probs[:, : self.num_classes]
-            else:
-                pad = np.zeros((probs.shape[0], self.num_classes - probs.shape[1]), dtype=np.float32)
-                probs = np.concatenate([probs, pad], axis=1)
+            raise RuntimeError(
+                f"模型输出类别数({probs.shape[1]})与配置 num_classes({self.num_classes})不匹配，"
+                f"请检查模型最后一层维度或配置中的 num_classes 参数"
+            )
 
         probs_sum = probs.sum(axis=1, keepdims=True)
         probs_sum = np.where(probs_sum == 0, 1.0, probs_sum)
