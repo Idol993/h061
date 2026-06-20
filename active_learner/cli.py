@@ -22,6 +22,7 @@ from rich.table import Table
 
 from .data_loaders import AudioLoader, ImageLoader, TextLoader
 from .models import ModelLoader, Predictor, Trainer
+from .pool import SamplePool, PoolDelta, PoolSnapshot
 from .reporters import CSVExporter, MetricsTracker, Visualizer
 from .samplers import DiversitySampler, HybridSampler, QBCSampler, UncertaintySampler
 from .selectors import BatchSelector
@@ -248,6 +249,22 @@ def select(config: str, budget: Optional[int], strategy: Optional[str], output_d
         run.total_samples = n_total
         run.labeled_samples = n_labeled
         tracker.save_runs()
+
+        pool = SamplePool(output_dir=cfg.output.output_dir)
+        pool.load()
+        pool.init_from_file_paths(file_paths, labels)
+        pool.save()
+
+        available_indices = pool.get_available_indices(file_paths)
+        n_available = len(available_indices)
+        snap_before = pool.snapshot()
+        console.print(
+            f"样本池: [bold]{n_total}[/bold] 总计 | "
+            f"[green]{snap_before.labeled}[/green] 已标注 | "
+            f"[yellow]{snap_before.pending}[/yellow] 待标注 | "
+            f"[cyan]{n_available}[/cyan] 可采样 | "
+            f"[dim]{snap_before.skipped}[/dim] 已跳过"
+        )
     
         with Progress(
             SpinnerColumn(),
@@ -388,7 +405,12 @@ def select(config: str, budget: Optional[int], strategy: Optional[str], output_d
                 raise click.ClickException(f"未知策略: {strategy_name}")
     
             progress.update(samp_task, advance=50)
-    
+
+            available_set = set(available_indices)
+            for i in range(len(hybrid_scores)):
+                if i not in available_set:
+                    hybrid_scores[i] = -1e9
+
             selector = BatchSelector(budget=budget, seed=cfg.seed)
             selection = selector.select(
                 scores=hybrid_scores,
@@ -414,6 +436,14 @@ def select(config: str, budget: Optional[int], strategy: Optional[str], output_d
         csv_path = exporter.export(selection)
         console.print(f"[green]✓[/green] CSV 已导出: [bold]{csv_path}[/bold]")
         run.output_csv = csv_path
+
+        selected_fps = [file_paths[idx] for idx in selection.indices if idx < len(file_paths)]
+        new_pending, repeated = pool.mark_pending(selected_fps)
+        pool.last_export_csv = csv_path
+        pool.save()
+        if repeated > 0:
+            console.print(f"[yellow]⚠[/yellow] {repeated} 个样本已在待标注状态（重复推荐）")
+        console.print(f"[green]✓[/green] 样本池: [bold]{new_pending}[/bold] 个新标记为待标注")
     
         if cfg.output.export_visualization:
             visualizer = Visualizer(output_dir=cfg.output.output_dir)
@@ -439,6 +469,13 @@ def select(config: str, budget: Optional[int], strategy: Optional[str], output_d
         ))
     finally:
         if "run" in locals():
+            pool_snap = pool.snapshot() if "pool" in locals() else None
+            pool_extra = {}
+            if pool_snap is not None:
+                pool_extra["pool_unlabeled"] = pool_snap.unlabeled
+                pool_extra["pool_pending"] = pool_snap.pending
+                pool_extra["pool_labeled"] = pool_snap.labeled
+                pool_extra["pool_skipped"] = pool_snap.skipped
             tracker.finish_run(
                 run,
                 status=run_status,
@@ -446,6 +483,7 @@ def select(config: str, budget: Optional[int], strategy: Optional[str], output_d
                 output_csv=csv_path,
                 output_visualization=feat_path,
                 class_names=class_names,
+                **pool_extra,
             )
 
 
@@ -527,6 +565,36 @@ def review(metrics: Optional[str], output_dir: Optional[str]):
 
         console.print(table)
 
+        has_pool_data = any(
+            r.extra.get("pool_unlabeled") is not None or r.extra.get("pool_pending") is not None
+            for r in tracker.runs
+        )
+        if has_pool_data:
+            console.print(Panel.fit(
+                "[bold cyan]每轮样本池变化[/bold cyan]",
+                border_style="cyan",
+            ))
+            pool_table = Table(show_lines=False)
+            pool_table.add_column("Run ID", style="cyan")
+            pool_table.add_column("Command", style="white")
+            pool_table.add_column("已标注", justify="right", style="green")
+            pool_table.add_column("待标注", justify="right", style="yellow")
+            pool_table.add_column("未标注", justify="right", style="cyan")
+            pool_table.add_column("已跳过", justify="right", style="dim")
+            for run in tracker.runs:
+                ex = run.extra or {}
+                if ex.get("pool_unlabeled") is None and ex.get("pool_pending") is None:
+                    continue
+                pool_table.add_row(
+                    str(run.run_id),
+                    str(run.command or ""),
+                    str(ex.get("pool_labeled", "")),
+                    str(ex.get("pool_pending", "")),
+                    str(ex.get("pool_unlabeled", "")),
+                    str(ex.get("pool_skipped", "")),
+                )
+            console.print(pool_table)
+
 
 @cli.command(help="用新标注数据重训练模型，并进行下一轮采样")
 @click.option("--config", "-c", required=True, type=click.Path(exists=True), help="YAML 配置文件路径")
@@ -593,6 +661,19 @@ def iterate(config: str, labels: str, resume: bool, output_dir: Optional[str]):
         run.labeled_samples = n_labeled
         tracker.save_runs()
 
+        pool = SamplePool(output_dir=cfg.output.output_dir)
+        pool.load()
+        pool.init_from_file_paths(file_paths, existing_labels)
+        pool.save()
+
+        snap_before = pool.snapshot()
+        console.print(
+            f"样本池: [bold]{n_total}[/bold] 总计 | "
+            f"[green]{snap_before.labeled}[/green] 已标注 | "
+            f"[yellow]{snap_before.pending}[/yellow] 待标注 | "
+            f"[dim]{snap_before.skipped}[/dim] 已跳过"
+        )
+
         import pandas as pd
         import chardet
 
@@ -627,6 +708,22 @@ def iterate(config: str, labels: str, resume: bool, output_dir: Optional[str]):
             fp = str(row[path_col]).replace("\\", "/")
             lbl = row[label_col]
             new_labels_map[fp] = lbl
+
+        recovered, dedup_count, n_external, external_paths = pool.apply_labels(
+            new_labels_map, file_paths,
+        )
+        pool.save()
+        if dedup_count > 0:
+            console.print(f"[yellow]去重:[/yellow] 标注 CSV 中 [bold]{dedup_count}[/bold] 条重复路径，按最后一条生效")
+        console.print(
+            f"[green]✓[/green] 样本池更新: [bold]{recovered}[/bold] 个待标注→已标注"
+        )
+        if n_external > 0:
+            console.print(f"[yellow]⚠[/yellow] [bold]{n_external}[/bold] 条标注路径不在数据集中（外部路径）:")
+            for ep in external_paths[:5]:
+                console.print(f"  [dim]- {ep}[/dim]")
+            if len(external_paths) > 5:
+                console.print(f"  [dim]... 共 {len(external_paths)} 条[/dim]")
 
         all_labels = [None] * len(file_paths)
         for i, fp in enumerate(file_paths):
@@ -836,6 +933,12 @@ def iterate(config: str, labels: str, resume: bool, output_dir: Optional[str]):
                     cfg.sampler.diversity_weight,
                 )
 
+        available_indices_iter = pool.get_available_indices(file_paths)
+        available_set_iter = set(available_indices_iter)
+        for i in range(len(hybrid_scores)):
+            if i not in available_set_iter:
+                hybrid_scores[i] = -1e9
+
         selector = BatchSelector(budget=budget, seed=cfg.seed)
         selection = selector.select(
             scores=hybrid_scores,
@@ -858,6 +961,14 @@ def iterate(config: str, labels: str, resume: bool, output_dir: Optional[str]):
         console.print(f"[green]✓[/green] 下一轮待标注 CSV: [bold]{csv_path}[/bold]")
         run.output_csv = csv_path
 
+        selected_fps_iter = [file_paths[idx] for idx in selection.indices if idx < len(file_paths)]
+        new_pending_iter, repeated_iter = pool.mark_pending(selected_fps_iter)
+        pool.last_export_csv = csv_path
+        pool.save()
+        if repeated_iter > 0:
+            console.print(f"[yellow]⚠[/yellow] {repeated_iter} 个样本已在待标注状态（重复推荐）")
+        console.print(f"[green]✓[/green] 样本池: [bold]{new_pending_iter}[/bold] 个新标记为待标注")
+
         if cfg.output.export_visualization:
             visualizer = Visualizer(output_dir=cfg.output.output_dir)
             labeled_mask_viz = np.array([_is_valid_label(l) for l in all_labels])
@@ -879,6 +990,13 @@ def iterate(config: str, labels: str, resume: bool, output_dir: Optional[str]):
         ))
     finally:
         if "run" in locals():
+            pool_snap = pool.snapshot() if "pool" in locals() else None
+            pool_extra = {}
+            if pool_snap is not None:
+                pool_extra["pool_unlabeled"] = pool_snap.unlabeled
+                pool_extra["pool_pending"] = pool_snap.pending
+                pool_extra["pool_labeled"] = pool_snap.labeled
+                pool_extra["pool_skipped"] = pool_snap.skipped
             tracker.finish_run(
                 run,
                 status=run_status,
@@ -890,6 +1008,7 @@ def iterate(config: str, labels: str, resume: bool, output_dir: Optional[str]):
                 class_names=class_names,
                 total_samples=total_samples,
                 labeled_samples=labeled_samples,
+                **pool_extra,
             )
 
 
@@ -1124,10 +1243,12 @@ def dry_run(config: str, labels: Optional[str]):
         checks_passed += 1
 
     if "dataset" in locals() and dataset is not None:
-        n_total = len(raw_items)
-        n_existing_labeled = sum(1 for l in (existing_labels or []) if _is_valid_label(l))
+        dry_pool = SamplePool(output_dir=cfg.output.output_dir)
+        dry_pool.load()
+        dry_pool.init_from_file_paths(file_paths, existing_labels)
         n_new_labels = 0
-        n_overlap = 0
+        n_external_labels = 0
+        n_dedup = 0
         if labels:
             try:
                 import chardet as _cd3
@@ -1150,42 +1271,39 @@ def dry_run(config: str, labels: Optional[str]):
                         break
                 if label_col3 is None and len(labels_df3.columns) > 1:
                     label_col3 = labels_df3.columns[-1]
-
                 if path_col3 and label_col3:
-                    valid_count = 0
-                    norm_file_paths = {str(fp).replace("\\", "/"): i for i, fp in enumerate(file_paths)}
-                    existing_labeled_set = set()
-                    for i, l in enumerate(existing_labels or []):
-                        if _is_valid_label(l) and i < len(file_paths):
-                            existing_labeled_set.add(str(file_paths[i]).replace("\\", "/"))
+                    dry_labels_map = {}
                     for _, row in labels_df3.iterrows():
+                        fp3 = str(row[path_col3]).replace("\\", "/")
                         lbl3 = row[label_col3]
                         if _is_valid_label(lbl3):
-                            valid_count += 1
-                            fp3 = str(row[path_col3]).replace("\\", "/")
-                            if fp3 in existing_labeled_set:
-                                n_overlap += 1
-                    n_new_labels = valid_count
+                            dry_labels_map[fp3] = lbl3
+                    n_new_labels = len(dry_labels_map)
+                    recovered, n_dedup, n_external_labels, _ = dry_pool.apply_labels(
+                        dry_labels_map, file_paths,
+                    )
             except Exception:
                 pass
 
-        n_unlabeled = n_total - n_existing_labeled
-        n_new_unique = n_new_labels - n_overlap
-        n_available_for_sampling = n_total - n_existing_labeled - n_new_unique
+        dry_snap = dry_pool.snapshot()
+        n_available_for_sampling = dry_snap.unlabeled
 
         stat_table = Table(show_lines=False)
         stat_table.add_column("统计项", style="cyan")
         stat_table.add_column("数量", justify="right", style="white")
-        stat_table.add_row("总样本数", str(n_total))
-        stat_table.add_row("已有标注", str(n_existing_labeled))
-        stat_table.add_row("本次新增标注", f"{n_new_labels} (其中去重后 {n_new_unique})")
-        stat_table.add_row("预计参与采样", str(max(0, n_available_for_sampling)))
+        stat_table.add_row("总样本数", str(len(file_paths)))
+        stat_table.add_row("已有标注", str(dry_snap.labeled))
+        stat_table.add_row("待标注(挂起)", str(dry_snap.pending))
+        if n_new_labels > 0:
+            stat_table.add_row("本次新标注", f"{n_new_labels} (去重 {n_dedup}, 外部 {n_external_labels})")
+        stat_table.add_row("未标注(可采样)", str(n_available_for_sampling))
+        stat_table.add_row("已跳过", str(dry_snap.skipped))
 
         console.print("\n[bold]样本统计:[/bold]")
         console.print(stat_table)
 
-        if max(0, n_available_for_sampling) < cfg.sampler.budget:
-            console.print(f"  [yellow]⚠[/yellow] 可采样样本数({max(0, n_available_for_sampling)})不足采样预算({cfg.sampler.budget})")
+        if n_available_for_sampling < cfg.sampler.budget:
+            console.print(f"  [yellow]⚠[/yellow] 可采样样本数({n_available_for_sampling})不足采样预算({cfg.sampler.budget})")
 
     console.print(Panel.fit(
         f"[bold]检查结果:[/bold] "
@@ -1197,6 +1315,63 @@ def dry_run(config: str, labels: Optional[str]):
 
     if checks_failed > 0:
         raise click.ClickException(f"预检查未通过 ({checks_failed} 项失败)，请修复后重试")
+
+
+@cli.command(help="查看样本池概况或按状态导出 CSV")
+@click.option("--config", "-c", required=True, type=click.Path(exists=True), help="YAML 配置文件路径")
+@click.option("--export", "-e", type=click.Choice(["unlabeled", "pending", "labeled", "skipped", "all"]),
+              help="按状态导出 CSV（默认仅查看概况）")
+@click.option("--output-dir", "-o", type=click.Path(), help="输出目录（默认用配置文件中的值）")
+def pool(config: str, export: Optional[str], output_dir: Optional[str]):
+    cfg = ConfigParser.load(config)
+    out_dir = Path(output_dir or cfg.output.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_pool = SamplePool(output_dir=out_dir)
+    sample_pool.load()
+
+    dataset, file_paths, raw_items, existing_labels = _load_dataset(cfg, console)
+    sample_pool.init_from_file_paths(file_paths, existing_labels)
+    sample_pool.save()
+
+    snap = sample_pool.snapshot()
+    n_total = len(file_paths)
+
+    console.print(Panel.fit(
+        f"[bold cyan]样本池概况[/bold cyan]\n"
+        f"总样本: [bold]{n_total}[/bold]\n"
+        f"[green]已标注: {snap.labeled}[/green]\n"
+        f"[yellow]待标注: {snap.pending}[/yellow]\n"
+        f"[cyan]未标注: {snap.unlabeled}[/cyan]\n"
+        f"[dim]已跳过: {snap.skipped}[/dim]"
+        + (f"\n最近导出: [bold]{sample_pool.last_export_csv}[/bold]" if sample_pool.last_export_csv else ""),
+        border_style="cyan",
+    ))
+
+    if export:
+        by_state = sample_pool.by_state()
+        states_to_export = [export] if export != "all" else ["unlabeled", "pending", "labeled", "skipped"]
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        for st in states_to_export:
+            fps = by_state.get(st, [])
+            if not fps:
+                console.print(f"[dim]状态 {st} 无样本，跳过[/dim]")
+                continue
+            rows = []
+            for fp in fps:
+                idx = None
+                for i, orig_fp in enumerate(file_paths):
+                    if orig_fp.replace("\\", "/") == fp:
+                        idx = i
+                        break
+                lbl = ""
+                if existing_labels is not None and idx is not None and idx < len(existing_labels):
+                    lbl = str(existing_labels[idx]) if _is_valid_label(existing_labels[idx]) else ""
+                rows.append({"file_path": fp, "label": lbl, "state": st})
+            export_df = pd.DataFrame(rows)
+            export_path = out_dir / f"pool_{st}_{timestamp}.csv"
+            export_df.to_csv(export_path, index=False, encoding="utf-8-sig")
+            console.print(f"[green]✓[/green] 导出 {st} ({len(fps)} 条): [bold]{export_path}[/bold]")
 
 
 @cli.command(help="生成示例配置文件")

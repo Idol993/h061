@@ -1,0 +1,25 @@
+{
+  "states": {
+    "data/sample_unlabeled.csv:2": "pending",
+    "data/sample_unlabeled.csv:3": "pending",
+    "data/sample_unlabeled.csv:4": "pending",
+    "data/sample_unlabeled.csv:5": "pending",
+    "data/sample_unlabeled.csv:6": "pending",
+    "data/sample_unlabeled.csv:7": "pending",
+    "data/sample_unlabeled.csv:8": "pending",
+    "data/sample_unlabeled.csv:9": "pending",
+    "data/sample_unlabeled.csv:10": "pending",
+    "data/sample_unlabeled.csv:11": "pending",
+    "data/sample_unlabeled.csv:12": "pending",
+    "data/sample_unlabeled.csv:13": "pending",
+    "data/sample_unlabeled.csv:14": "pending",
+    "data/sample_unlabeled.csv:15": "pending",
+    "data/sample_unlabeled.csv:16": "pending",
+    "data/sample_unlabeled.csv:17": "pending",
+    "data/sample_unlabeled.csv:18": "pending",
+    "data/sample_unlabeled.csv:19": "pending",
+    "data/sample_unlabeled.csv:20": "pending",
+    "data/sample_unlabeled.csv:21": "pending"
+  },
+  "last_export_csv": "outputs\\selected_samples_20260621_054942.csv"
+}
