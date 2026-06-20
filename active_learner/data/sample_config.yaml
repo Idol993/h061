@@ -1,0 +1,76 @@
+# ============================================================
+# 主动学习样本选择工具 - 示例配置文件
+# ============================================================
+
+data:
+  # 数据类型: text / image / audio
+  data_type: text
+  # 未标注数据集路径（CSV/TXT/JSON 或目录）
+  data_path: ./data/sample_unlabeled.csv
+  # 已标注数据 CSV 路径（可选）
+  labeled_path: ./data/sample_labels.csv
+  # 文本列名（自动检测）
+  text_column: text
+  # 标签列名（自动检测）
+  label_column: label
+  # 图像输入尺寸 (H, W)
+  image_size: [224, 224]
+  # 音频采样率
+  audio_sr: 22050
+  # MFCC 特征维度
+  audio_mfcc: 40
+
+model:
+  # 基线模型路径 (.pkl / .pth / .onnx)
+  model_path: ./checkpoints/dummy_model.pkl
+  # 模型类型（可选，自动根据后缀推断：sklearn/pytorch/onnx）
+  model_type: null
+  # 类别数量
+  num_classes: 4
+  # 推理设备: auto / cpu / cuda
+  device: auto
+  # 推理批大小
+  batch_size: 32
+
+sampler:
+  # 采样策略: uncertainty / diversity / hybrid / qbc
+  strategy: hybrid
+  # 不确定性采样方法: least_confidence / margin / entropy
+  uncertainty_method: entropy
+  # 不确定性权重（0-1）
+  uncertainty_weight: 0.6
+  # 多样性权重（0-1，两者之和必须=1）
+  diversity_weight: 0.4
+  # 每轮选择样本数（预算）
+  budget: 20
+  # 特征提取器模型名（可选，文本默认 all-MiniLM-L6-v2）
+  feature_extractor: null
+  # KMeans 簇数（默认=budget）
+  num_clusters: null
+
+train:
+  # 是否启用重训练
+  enabled: true
+  # 训练轮数
+  epochs: 10
+  # 学习率
+  learning_rate: 0.0001
+  # 早停耐心值
+  early_stopping_patience: 3
+  # 冻结骨干网络（仅训练最后一层）
+  freeze_backbone: true
+  # 模型 checkpoint 保存目录
+  checkpoint_dir: ./checkpoints
+
+output:
+  # 输出目录
+  output_dir: ./outputs
+  # 是否导出 CSV
+  export_csv: true
+  # 是否导出来可视化 HTML
+  export_visualization: true
+  # 终端显示 Top-K 推荐样本
+  top_k_display: 20
+
+# 随机种子
+seed: 42

@@ -1,0 +1,9 @@
+file_path,label
+./data/samples/pos_001.txt,positive
+./data/samples/pos_002.txt,positive
+./data/samples/neg_001.txt,negative
+./data/samples/neg_002.txt,negative
+./data/samples/neu_001.txt,neutral
+./data/samples/neu_002.txt,neutral
+./data/samples/mix_001.txt,mixed
+./data/samples/mix_002.txt,mixed
